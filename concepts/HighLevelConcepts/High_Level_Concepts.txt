@@ -1,0 +1,580 @@
+# YARP Concepts — Part 1: Foundations
+
+> **How to read this series.** These three documents teach the *ideas* behind YARP (Yet Another Reverse Proxy), not its code or folder layout. The goal is that when you eventually open the source, every term, pattern, and design decision already feels familiar. Part 1 builds the bedrock: what a reverse proxy *is*, the network and protocol concepts it lives on top of, and the hosting model it is built from. Part 2 covers traffic management and resilience. Part 3 covers performance, concurrency, and operations.
+>
+> **A note on tailoring.** No `persona.md` was found in this repository, so this document assumes you have a solid general programming background (you can read code, understand functions and data structures) but may be newer to distributed systems, networking internals, and the ASP.NET Core platform. If you create a `persona.md` describing your exact background and goals, a regenerated version of this document can target your specific blind spots far more precisely.
+
+---
+
+## 1. Executive Overview: What YARP Actually Is
+
+YARP is a **toolkit for building reverse proxies** in .NET. That phrasing matters. It is not a finished product you configure and forget; it is a *library* you compose into your own application, giving you a proxy whose every behavior you can intercept, replace, or extend in code.
+
+A **reverse proxy** is a server that sits in front of one or more backend servers and forwards client requests to them. To the outside world it *looks like* the real server — clients connect to it, not to the backends. It receives each incoming HTTP request, decides which backend should handle it, forwards the request, receives the backend's response, and relays that response back to the client. Everything YARP does — routing, load balancing, health checking, header rewriting, TLS termination — is in service of doing that one loop well, fast, and flexibly.
+
+The reason a whole project exists for this is that "forward the request to a backend" hides an enormous amount of difficulty once you care about **performance** (tens of thousands of requests per second per node), **correctness** (HTTP is a deceptively subtle protocol), **resilience** (backends fail, networks partition), and **dynamism** (the set of backends changes constantly as services scale up and down). YARP's central design bet is that no single fixed feature set can satisfy every team, so it exposes its internal pipeline as extension points rather than locking behavior behind configuration flags.
+
+---
+
+## 2. Your Personal Mindset Shift
+
+If your background is mostly writing application logic — functions that take input, compute, and return output — a proxy will stretch you in three specific directions, and it is worth naming them up front because they recur throughout the codebase.
+
+**From "process the data" to "move the bytes."** In ordinary application code you own the data; you parse it, transform it, and emit it. A proxy frequently must move gigabytes of request and response bodies *without ever materializing them in memory*. The mental model shifts from "load it, work on it, save it" to "open two pipes and let bytes flow between them." This is the difference between thinking in **values** and thinking in **streams**, and it dominates the performance-critical paths.
+
+**From "call a function" to "traverse a pipeline."** A request in YARP is not handled by one method. It passes through an ordered chain of independent components (middleware), each of which can inspect it, modify it, short-circuit it, or pass it along. You will stop asking "what function handles this request?" and start asking "what does the pipeline do to this request, in what order?"
+
+**From "the world is static" to "the world changes under me."** The list of backends, their health, and the routing rules can all change *while requests are in flight*. Code that assumes a fixed configuration is wrong here. A recurring theme — explored deeply in Part 3 — is how YARP lets configuration change continuously without locks, race conditions, or stalls. If you have only ever worked with single-threaded or request-scoped state, this is the largest stretch, and it is genuinely beautiful once it clicks.
+
+Keep these three shifts in mind. Almost every concept below is an instance of one of them.
+
+---
+
+## 3. Forward Proxy vs. Reverse Proxy
+
+These two terms are confusingly similar and worth pinning down precisely, because YARP is firmly in the second camp.
+
+A **forward proxy** acts on behalf of *clients*. Your corporate network might route all outbound web traffic through a forward proxy that enforces policy ("no social media"), caches popular content, and hides individual machines behind one IP. The client knows it is using a proxy; the destination servers generally do not.
+
+A **reverse proxy** acts on behalf of *servers*. Clients think they are talking to the real service, but they are actually talking to the proxy, which fans their requests out to a pool of backends behind it. The backends are hidden; the client is generally unaware a proxy exists at all.
+
+```
+Forward proxy:   [many clients] → [proxy] → the whole internet
+Reverse proxy:   the whole internet → [proxy] → [your backend pool]
+```
+
+The direction of "who is being represented" is the whole distinction. A reverse proxy is the gatekeeper *in front of your infrastructure*. That single position lets it perform an outsized set of jobs: it is the natural place to terminate TLS, balance load, enforce rate limits, check backend health, rewrite URLs, add security headers, and present a unified front door to a sprawl of internal services. Understanding *why* the reverse proxy is the right home for each of these duties is half of understanding YARP.
+
+---
+
+## 4. Layer 4 vs. Layer 7: Where YARP Operates
+
+Networking is described in **layers** (the OSI model). Two matter intensely for proxies.
+
+**Layer 4 (the transport layer)** deals with raw connections — TCP and UDP. A Layer 4 (L4) load balancer or proxy forwards *bytes* between a client connection and a backend connection without understanding what those bytes mean. It can see IP addresses and ports but not URLs, headers, or cookies. It is extremely fast and protocol-agnostic, but blind to application meaning.
+
+**Layer 7 (the application layer)** deals with the actual protocol — for the web, that is HTTP. A Layer 7 (L7) proxy *parses* each request: it reads the method, the path, the headers, the host. Because it understands the request, it can make intelligent decisions ("requests for `/api/billing` go to the billing service; requests for `/images` go to the CDN tier") and modify requests and responses.
+
+**YARP is a Layer 7 reverse proxy.** This is its defining characteristic. Everything it offers — path-based routing, header matching, transforms, session affinity — is only possible because it parses and understands HTTP. The cost of L7 is that parsing takes work, which is exactly why YARP obsesses over doing that work efficiently. When you read the source and see careful avoidance of string allocations and re-parsing, remember: it is paying the L7 tax as cheaply as possible.
+
+---
+
+## 5. HTTP: The Protocol YARP Speaks
+
+Because YARP lives at Layer 7, you cannot fully understand it without understanding HTTP. Here are the conceptual pieces that the codebase assumes you know.
+
+### 5.1 The request/response model
+
+HTTP is a **request/response** protocol. A client sends a request — a **method** (GET, POST, PUT, DELETE, …), a **target** (the path and query string, e.g. `/api/orders?id=5`), a set of **headers** (key/value metadata like `Host`, `Authorization`, `Content-Type`), and optionally a **body** (the payload, e.g. JSON or an uploaded file). The server replies with a response — a **status code** (200 OK, 404 Not Found, 503 Service Unavailable, …), its own headers, and optionally a body.
+
+A reverse proxy handles *two* request/response exchanges per proxied call, joined at the hip: the **inbound** exchange between client and proxy, and the **outbound** exchange between proxy and backend. Much of YARP's subtlety is in deciding how the inbound request is translated into the outbound one, and how the backend's response is translated back. That translation is the job of **transforms** (Part 2).
+
+### 5.2 Headers, and why they are dangerous
+
+Headers carry the metadata that makes proxying tricky. Some headers describe the *connection* (like `Connection`, `Keep-Alive`, `Transfer-Encoding`) and must **not** be blindly copied from one hop to the next, because they describe the client↔proxy hop, not the proxy↔backend hop. These are called **hop-by-hop headers**, as opposed to **end-to-end headers** that should be preserved. A correct proxy must know the difference. Getting this wrong causes some of the most baffling bugs in all of networking, and a large amount of YARP's request-handling code exists precisely to handle headers correctly.
+
+A second header subtlety: the backend often needs to know facts about the *original* client that are otherwise lost once the proxy is in the middle — the client's real IP address, the original `Host` it asked for, whether the original connection used HTTPS. These are communicated with **forwarded headers** (`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, and the standardized `Forwarded` header). Managing them correctly — and *not* trusting spoofed ones from untrusted clients — is a recurring security theme.
+
+### 5.3 The protocol versions: HTTP/1.1, HTTP/2, HTTP/3
+
+HTTP has evolved, and a proxy must straddle multiple versions because the client side and the backend side can each speak a different one.
+
+**HTTP/1.1** is text-based and uses one request per connection at a time (with keep-alive reusing the connection for sequential requests). Its limitation is **head-of-line blocking**: a slow response holds up the connection.
+
+**HTTP/2** introduces **multiplexing** — many concurrent requests (called **streams**) share a single TCP connection, interleaved as binary **frames**. This is a major efficiency gain and is why HTTP/2 appears repeatedly in YARP's internals (for example, the tunneling feature multiplexes many proxied requests over one HTTP/2 connection between two proxies). HTTP/2 still suffers TCP-level head-of-line blocking because all streams share one ordered TCP byte stream.
+
+**HTTP/3** moves off TCP entirely onto **QUIC**, a protocol built on UDP that provides independent streams so a lost packet on one stream does not stall the others. It also folds TLS in by default.
+
+The conceptual takeaway: a proxy is a **protocol translation point**. A client might connect over HTTP/3, while the backend only speaks HTTP/1.1; YARP terminates one and originates the other. You do not need to memorize frame formats, but you must hold the idea that "the version on the way in need not match the version on the way out," because it explains why YARP configures protocol versions per cluster and why so much care goes into translating semantics rather than bytes.
+
+### 5.4 WebSockets and other upgraded/streaming protocols
+
+Normal HTTP is one request, one response. But some interactions are **long-lived and bidirectional**. **WebSockets** start as an ordinary HTTP request carrying an `Upgrade` header, then "upgrade" the connection into a raw two-way channel that stays open, over which both sides send messages whenever they like (chat, live dashboards, multiplayer games). **gRPC** and **Server-Sent Events** are other long-lived streaming patterns built on HTTP.
+
+For a proxy these are special because the "request then response" assumption breaks: after the upgrade, there is just a duplex stream of bytes to be shuttled in both directions until one side closes. YARP must detect the upgrade, stop treating the exchange as request/response, and switch into a **byte-pumping** mode that copies data both ways simultaneously. This is a direct instance of the "move the bytes, don't process them" mindset shift, and YARP has dedicated machinery (and even dedicated telemetry) for WebSocket traffic.
+
+---
+
+## 6. The Reverse Proxy Pipeline (Conceptual Lifecycle)
+
+Now we assemble the pieces into the **life of a request** through YARP. This is the single most important mental model in the entire system. Read it slowly; everything in Parts 2 and 3 hangs off one of these stages.
+
+1. **Acceptance.** A client connection arrives at the web server (Kestrel — see §7). The raw bytes are parsed into a structured HTTP request.
+
+2. **Routing / matching.** YARP examines the request — its path, host, headers, method, query — and matches it against the configured **routes** to decide *which route* applies. A route identifies a logical destination: a **cluster**. (Part 2, §Routing.)
+
+3. **Affinity resolution.** If **session affinity** is enabled, YARP checks whether this client was previously "stuck" to a particular backend (e.g., via a cookie) and, if so, steers it back there. (Part 2.)
+
+4. **Destination selection / load balancing.** The chosen cluster has a pool of **destinations** (concrete backend addresses). A **load-balancing policy** picks exactly one healthy destination to receive this request. (Part 2.)
+
+5. **Health filtering.** Only destinations currently considered **healthy** are eligible. Health is continuously assessed by active probes and by observing real traffic outcomes. (Part 2.)
+
+6. **Request transformation.** The inbound request is transformed into the outbound request: headers added/removed/rewritten, path and query adjusted, forwarded headers stamped on. (Part 2.)
+
+7. **Forwarding.** The transformed request is sent to the chosen destination using a pooled HTTP client. The backend's response streams back. Request and response bodies are copied as streams, not buffered. (Part 3.)
+
+8. **Response transformation.** The backend's response is transformed on its way back to the client (e.g., stripping or adding response headers).
+
+9. **Observation.** Throughout, the outcome (success, latency, failure type) is recorded — feeding metrics, traces, logs, and passive health assessment.
+
+The elegance is that each numbered stage is a **replaceable component**. You can swap the load-balancing policy, inject a custom transform, provide your own health policy, or hook the forwarding step — without rewriting the rest. That composability is the product.
+
+---
+
+## 7. The Platform Underneath: ASP.NET Core
+
+YARP is not built from scratch. It stands on **ASP.NET Core**, Microsoft's web framework, and reuses its highest-performance machinery. You will understand YARP much faster if you understand the four platform concepts it leans on most.
+
+### 7.1 Kestrel: the web server
+
+**Kestrel** is ASP.NET Core's built-in, cross-platform, high-performance HTTP server. It does the low-level work of accepting TCP connections, speaking HTTP/1.1, HTTP/2, and HTTP/3, doing TLS, and turning raw bytes into structured request objects. YARP delegates all of that to Kestrel and concentrates on the proxy logic above it. When you read about YARP "receiving a request," it is Kestrel that physically did the receiving. (An alternative server, **HTTP.sys**, is used on Windows for certain advanced features like request delegation — Part 3.)
+
+### 7.2 The middleware pipeline
+
+ASP.NET Core processes every request through a **middleware pipeline**: an ordered sequence of components, each a function that receives the request context and a reference to "the next component." Each middleware may do work before calling the next, after it returns, both, or neither (short-circuiting the pipeline entirely). Conceptually it is like a set of nested wrappers — often pictured as an onion — where the request travels inward through each layer and the response travels back outward through the same layers in reverse.
+
+```
+request  →  [ Auth ]→[ RateLimit ]→[ Routing ]→[ LoadBalance ]→[ Forward ]
+response ←  [ Auth ]←[ RateLimit ]←[ Routing ]←[ LoadBalance ]←[ Forward ]
+```
+
+This is the concrete realization of the "traverse a pipeline" mindset. YARP's stages from §6 — load balancing, session affinity, health, the final forwarder — are each implemented as middleware. The **order** of middleware is semantically critical: authentication must run before forwarding; rate limiting must run before you commit a backend to the work. Much of configuring YARP is really about arranging this pipeline correctly.
+
+### 7.3 Endpoint routing
+
+ASP.NET Core has a built-in **endpoint routing** system: a two-phase mechanism where one early middleware *matches* the request to an endpoint (using an efficient matching structure over all registered routes), and a later middleware *executes* that endpoint. The matching supports constraints and custom **matcher policies** that can accept or reject candidate endpoints based on headers, query parameters, and so on. YARP plugs its own route table and custom matcher policies into this system rather than reinventing request matching — so YARP routes get the same fast, well-tested matching engine that the rest of ASP.NET Core uses. (Details in Part 2.)
+
+### 7.4 Dependency injection and the host
+
+ASP.NET Core is built around **dependency injection (DI)**: components declare the services they need (by interface), and a central **container** supplies concrete implementations at runtime. This is *the* mechanism by which YARP achieves its "customize anything" goal. Nearly every behavior — the config provider, the load-balancing policies, the health policies, the transform factories, the HTTP client factory — is registered in the DI container behind an interface. To change a behavior, you register your own implementation; YARP picks it up automatically. When you see interfaces like `I…Policy`, `I…Provider`, `I…Factory` throughout the source, understand them as **seams**: deliberate places where the platform lets you substitute your code for the default.
+
+The **host** and the **builder** are the startup-time objects that wire all this together: you describe the services and the pipeline, and the host runs the resulting application. The recurring `AddReverseProxy()` and `MapReverseProxy()` style calls you will see are just the registration (services) and pipeline-placement (middleware/endpoints) steps of this host model.
+
+---
+
+## 8. The Three Core Abstractions: Routes, Clusters, Destinations
+
+If you remember nothing else, remember these three nouns. They are the vocabulary of the entire system, and every configuration file, every model class, and every diagram is organized around them.
+
+A **Route** is a *rule for matching incoming requests*. It says, in effect, "requests that look like *this* (this path pattern, optionally these hosts/headers/methods) belong to *that* cluster." Routes are about the **client-facing** side: what the outside world asks for. A route also carries an **order** (for resolving overlaps) and can attach metadata, authorization requirements, CORS policy, rate-limiter and timeout selections, and a chain of transforms.
+
+A **Cluster** is a *named group of interchangeable backends* that can all serve the same logical service, plus the **policies** for how to treat that group: which load-balancing policy to use, how to health-check it, whether to apply session affinity, what HTTP version and client settings to use when talking to it. A cluster is the **service-facing** abstraction: "the orders service" might be one cluster.
+
+A **Destination** is a *single concrete backend address* within a cluster — one URL, one server instance. Clusters contain many destinations; load balancing chooses among them; health checking marks individual ones up or down; service discovery adds and removes them as the backend fleet scales.
+
+```
+Route  ──matches──▶  Cluster  ──contains──▶  Destination
+"/api/* → orders"    "orders"               https://10.0.0.5:443
+                                            https://10.0.0.6:443
+                                            https://10.0.0.7:443
+```
+
+The relationship is layered exactly as the request lifecycle uses it: routing picks the **route** (hence the cluster), and load balancing + health picks the **destination**. Almost every feature in Parts 2 and 3 is "a smarter way to do one of those two selections," or "a way to keep these three things accurate as the world changes."
+
+---
+
+## 9. Configuration as a First-Class, Living Concept
+
+A final foundational idea, because it pervades the design. YARP treats **configuration** — the set of routes, clusters, and destinations and all their options — as **data that lives and changes at runtime**, not as static startup settings.
+
+Two consequences follow, and both are deliberate design goals stated in YARP's own README. First, configuration can come from **anywhere**: a JSON file, a database, a service registry, a Kubernetes API, or your own management system. YARP abstracts "where config comes from" behind a provider interface so you can supply your own source. Second, configuration can be **swapped while the server runs** — new routes appear, destinations come and go, health-check intervals change — *without restarting and without dropping in-flight requests*. The README explicitly frames programmatic, in-process, hot-reloadable configuration as the primary scenario, not an afterthought.
+
+Making "the world changes under me" safe and cheap is one of YARP's deepest engineering achievements, built on immutable snapshots and atomic pointer swaps. That machinery is the centerpiece of Part 3. For now, simply internalize the principle: **in YARP, configuration is a stream of immutable snapshots, not a fixed object.**
+
+---
+
+## 10. Mental Sandbox
+
+Test your conceptual grip before moving on. You do not need to write code — reason through these.
+
+1. **The header trap.** A client sends a request with `Connection: keep-alive` and `Authorization: Bearer abc`. As the proxy author, which of these two headers should be forwarded to the backend and which should not, and *why*? (Hint: hop-by-hop vs. end-to-end, §5.2.) What real-world bug occurs if you get it backwards?
+
+2. **Protocol mismatch.** A client connects over HTTP/3, but a particular cluster's destinations only speak HTTP/1.1. At which stage of the request lifecycle (§6) does this matter, and what does it mean to say the proxy "terminates one protocol and originates another"? What information might be lost in translation, and how would forwarded headers help recover it?
+
+3. **Drawing the model.** Sketch, from memory, the Route → Cluster → Destination relationship for a system with two services (`web` and `api`), where `api` has three backend instances and `web` has one. Which abstraction does load balancing operate on? Which does routing operate on? Where would a health check mark something unhealthy?
+
+When those three feel obvious, you are ready for **Part 2: Traffic Management & Resilience**, where each selection step — routing, load balancing, health, affinity — is opened up in depth.
+# YARP Concepts — Part 2: Traffic Management & Resilience
+
+> Part 1 built the foundations: what a reverse proxy is, the HTTP and ASP.NET Core ideas underneath it, the request lifecycle, and the Route → Cluster → Destination model. Part 2 opens up the *decision-making* stages of that lifecycle — how YARP chooses where a request goes, how it keeps that choice healthy and sticky, how it discovers backends, and how it rewrites requests on the way through. These are the concepts that turn "forward bytes to a server" into "intelligently manage live traffic across a fleet."
+
+---
+
+## 1. Routing and Request Matching
+
+### The "Why"
+
+A reverse proxy fronts many services behind one address. The very first intelligent thing it must do is decide, for each request, *which logical service is being asked for*. This is **routing**: mapping an inbound request to a **route**, and through it to a **cluster**. Get this wrong and every later stage is moot.
+
+The difficulty is twofold. First, the matching criteria are rich: real systems route on path patterns (`/api/orders/{id}`), on host name (`orders.example.com` vs `images.example.com`), on HTTP method, on the presence or value of headers, and on query parameters — often in combination. Second, it must be **fast**, because matching happens on every single request, and the route table can be large.
+
+### The Theory
+
+The core computer-science problem is **multi-dimensional request classification**: given a request described by several attributes, find the most specific matching rule among many candidates, quickly. The naive approach — test every route against every request — is *O(number of routes)* per request and does not scale.
+
+The established solution, which YARP adopts by building on ASP.NET Core's **endpoint routing**, is to compile the route table into an efficient matching structure. Path matching uses a **prefix tree (trie)**-style structure so that matching cost grows with the length of the path, not the number of routes. Non-path criteria (headers, query parameters, methods) are expressed as **matcher policies**: pluggable predicates that the routing engine consults to accept or reject candidate endpoints during matching. When multiple routes could match, **route order** and **specificity** break the tie deterministically — a more specific path or a route with explicit precedence wins.
+
+Two subtleties worth holding:
+
+- **Precedence and ambiguity.** If `/api/{**catchall}` and `/api/orders` both match `/api/orders`, the more specific one should win. Routing engines define precedence rules (segment specificity, then explicit order) so the outcome is predictable rather than dependent on registration order.
+- **Header and query matching modes.** Matching a header is not just "present or not." YARP models match *modes* — exact value, prefix, presence-only, and so on — and likewise for query parameters. This is richer than path matching and is why header/query matching is implemented as custom matcher policies layered onto the base engine.
+
+### The Implementation (conceptually, in YARP)
+
+YARP translates each configured route into an ASP.NET Core **endpoint** and registers custom **matcher policies** for headers and query parameters so that those dimensions participate in the same fast matching pass as the path. Route configuration carries the path pattern plus optional host, method, header, and query-parameter constraints. The result of routing is not "run a handler" as in a normal web app, but "this request is bound to *this* route/cluster" — that binding is then read by the downstream proxy middleware. The key insight: **YARP does not reinvent matching; it expresses proxy routes in the platform's own routing vocabulary and extends it where proxying needs more (header/query matchers).**
+
+---
+
+## 2. Load Balancing
+
+### The "Why"
+
+A cluster typically has many interchangeable **destinations** so it can handle more load and survive individual failures. Once routing has chosen the cluster, something must choose *which destination* receives this particular request. That choice is **load balancing**, and its quality directly determines tail latency, throughput, and how evenly your backends wear out. A bad policy overloads one server while others idle; a good one spreads work so the slowest request stays fast.
+
+### The Theory
+
+Load balancing is a problem in **online assignment under uncertainty**: you must place each arriving request without knowing the future arrival pattern and with only imperfect, slightly stale knowledge of each backend's current load. Several classic policies trade off simplicity, fairness, and quality of information. YARP ships the canonical family, and understanding each one's theory tells you when to reach for it.
+
+**Round Robin** cycles through destinations in order: 1, 2, 3, 1, 2, 3… It is trivially simple and gives perfectly even *request counts* if all requests cost the same. Its weakness is that requests are *not* equal — one slow request can pile onto a server that round-robin keeps feeding regardless of how busy it already is.
+
+**Random** picks a destination uniformly at random. With enough requests the distribution evens out by the law of large numbers, and it needs no shared state (which matters across multiple proxy instances). Its weakness is variance: by chance it can transiently overload a server, and like round-robin it ignores current load.
+
+**Least Requests** picks the destination with the fewest in-flight requests right now. This is **load-aware**: it actively steers away from busy servers, so a server stuck on slow requests stops receiving new ones. The cost is that it requires tracking a live counter of outstanding requests per destination — cheap, but it is shared mutable state that must be updated as requests start and finish.
+
+**Power of Two Choices (P2C)** is the elegant compromise and often the best default. Instead of scanning *all* destinations for the least-loaded (which is costly at scale and contends on shared state), it picks **two** destinations at random and sends the request to the less-loaded of the two. The mathematics here is striking: choosing the better of just two random options reduces the maximum load from growing like $\frac{\log n}{\log\log n}$ (pure random) to growing like $\frac{\log\log n}{\log 2}$ — an exponential improvement in the worst-case imbalance, for almost no extra cost. This result is often called "the power of two choices," and it is why P2C is a staple of modern load balancers.
+
+**First** simply uses the first available destination, only moving on when it is unavailable. This sounds naive but is exactly right for **active/passive failover**: you *want* all traffic on the primary, falling to the secondary only when the primary is down.
+
+A summary you can carry:
+
+| Policy | Information used | Best for | Main cost |
+| --- | --- | --- | --- |
+| First | order only | active/passive failover | no spreading |
+| Round Robin | position counter | uniform, equal-cost requests | ignores real load |
+| Random | none (stateless) | many proxy nodes, simplicity | variance |
+| Least Requests | exact in-flight counts | uneven request costs | scans all, shared state |
+| Power of Two Choices | two sampled in-flight counts | general default at scale | tiny sampling overhead |
+
+### The Implementation (conceptually, in YARP)
+
+Each policy is an implementation of a single load-balancing interface, registered by name, and a cluster selects one by name in its config. The load-balancing **middleware** sits in the pipeline after routing and health filtering: it receives the set of *available* (healthy) destinations and asks the configured policy to pick one. Because the policy is just a pluggable interface, writing a custom policy (say, weighted or geography-aware) means implementing that one interface and registering it — no other part of YARP changes. This is the §7 DI "seam" idea from Part 1 made concrete.
+
+---
+
+## 3. Health Checking
+
+### The "Why"
+
+Backends fail — they crash, get overloaded, deploy a bad build, lose their database connection. If the proxy keeps sending traffic to a sick destination, users get errors. **Health checking** is how YARP continuously decides which destinations are fit to receive traffic, so the load balancer only ever chooses among the healthy ones. This is the difference between a proxy that gracefully rides out a partial outage and one that amplifies it.
+
+### The Theory
+
+There are two complementary philosophies for assessing health, and YARP implements both because each catches what the other misses.
+
+**Active health checking** *proactively probes* each destination on a schedule — sending a dedicated request (often to a special health endpoint like `/health`) and judging the response. Its strength is that it detects problems even when no real traffic is flowing to that destination, and it can detect *recovery* (a server that came back) so the destination can be reintroduced. Its cost is extra traffic and the need for a scheduler firing probes at intervals. YARP's default active policy is **Consecutive Failures**: a destination is marked unhealthy after *N* probes fail in a row, which avoids overreacting to a single blip.
+
+**Passive health checking** *observes the real traffic already flowing* and infers health from outcomes — timeouts, connection failures, 5xx responses. Its strength is that it is free (no extra requests) and reflects exactly what real users are experiencing. Its weakness is that it only learns about destinations currently receiving traffic, and once it marks one unhealthy it has no traffic to that destination to notice recovery — so it typically pairs with a **reactivation timer** that tentatively returns the destination after a cool-off. YARP's default passive policy is **Transport Failure Rate**: it tracks the *proportion* of failed transport attempts in a sliding time window and trips when that rate crosses a threshold, which is more robust than counting raw failures because it accounts for volume.
+
+This passive pattern is closely related to the **circuit breaker** idea from resilience engineering: when failures to a dependency exceed a threshold, you "open the circuit" and stop sending requests for a while, then "half-open" to test whether it has recovered before fully restoring traffic. Reading YARP's passive health code with the circuit-breaker mental model makes it click immediately.
+
+A second important concept is the **health state has three values, not two**: `Healthy`, `Unhealthy`, and **`Unknown`** (not yet probed). What do you do with `Unknown` destinations? YARP makes this a policy too — the **available-destinations policy**. The default treats both `Healthy` and `Unknown` as usable (so a freshly added destination isn't excluded just because it hasn't been probed yet). And there is a crucial safety policy called **Healthy-Or-Panic**: if checking health would leave you with *zero* usable destinations, it is better to send traffic to *all* of them and hope, rather than return errors to every user. "Panic mode" — when everything looks unhealthy, treat everything as healthy — is a subtle but vital piece of production wisdom baked into the design.
+
+### The Implementation (conceptually, in YARP)
+
+Active checks are driven by a monitor that uses an **entity scheduler** to fire probes per cluster on its configured interval, sends probe requests via a pluggable probing-request factory, and feeds results into a destination health updater. Passive checks live in a **middleware** that inspects the outcome of each proxied request and updates the destination's passive health state, with reactivation scheduled after a period. Both active and passive states are combined to produce each destination's overall health, and the available-destinations policy decides the final usable set the load balancer sees. Every piece — active policy, passive policy, available-destinations policy, probing-request factory — is a named, swappable interface.
+
+---
+
+## 4. Session Affinity (Sticky Sessions)
+
+### The "Why"
+
+Load balancing assumes destinations are interchangeable, but sometimes they aren't *for a given user*. If a backend keeps per-user state in memory (an in-progress shopping cart, a cached session, an upload), then sending that user's next request to a *different* backend loses the state. **Session affinity** (also called "sticky sessions") ensures that once a client is associated with a destination, its subsequent requests keep going to the *same* destination.
+
+### The Theory
+
+Affinity is fundamentally about **mapping a client identity to a destination and remembering it across requests**, in a system that is otherwise stateless per request. Two questions define the design space.
+
+**How do you recognize the same client again?** The proxy must carry an identifier between requests. The classic mechanism is a **cookie** the proxy sets on the first response and the client returns on every subsequent request; the cookie encodes which destination the client is bound to. An alternative is keying off an existing request **header** (e.g., a client-supplied identifier). YARP supports cookie-based and custom-header-based affinity.
+
+**How do you keep the binding tamper-proof and private?** If the cookie literally said "you are bound to server #3," a client could forge it, and you would leak your topology. So affinity values are typically **encrypted** or **hashed** rather than stored in plaintext. YARP has hashed-cookie and encrypted variants precisely so the binding cannot be read or forged by the client. (The encryption reuses ASP.NET Core's **data protection** system — the platform's standard facility for protecting small pieces of data with managed keys.)
+
+The hardest part is the failure case: **what happens when the affinitized destination is gone or unhealthy?** This is the **affinity failure policy**. There are two reasonable answers, and YARP offers both. One is to **redistribute** — give up on the dead destination and load-balance the request to a healthy one (good availability, but the user loses their server-side state). The other is to **return a 503 error** — refuse rather than silently route to a server that lacks the user's state (good correctness, worse availability). Which is correct depends entirely on what the state means, which is why it is a policy decision and not a fixed behavior.
+
+### The Implementation (conceptually, in YARP)
+
+Affinity is realized as a **middleware** that runs in the request lifecycle *around* destination selection: before load balancing, it checks for an existing affinity marker and, if found and valid, pins the request to that destination; after a destination is chosen for a new session, an **affinitize transform** stamps the marker onto the response (e.g., sets the cookie). The recognition mechanism (cookie/header), the protection mechanism (hash/encrypt), and the failure handling (redistribute/503) are each separate, named, swappable policies — once again the same plug-in architecture.
+
+---
+
+## 5. Service Discovery (Dynamic Destinations)
+
+### The "Why"
+
+In Part 1 we said the world changes under you. Nowhere is that more true than the **set of destinations**. In a modern deployment, backend instances are created and destroyed constantly — autoscaling, rolling deployments, crashes, container rescheduling. Hard-coding IP addresses in config is hopeless. **Service discovery** is the concept of *resolving the current set of backend addresses dynamically* rather than listing them statically.
+
+### The Theory
+
+Service discovery answers "where, right now, are the instances of this service?" There are several standard sources of truth. **DNS** is the most universal: a single service name resolves to a list of IP addresses (and that list changes as instances come and go). **Orchestrator APIs** like Kubernetes maintain authoritative, real-time membership and can push changes. **Service registries** (Consul, Eureka, etc.) are dedicated databases of live instances.
+
+The recurring design problem is **staleness vs. cost**. Resolving fresh on every request is correct but expensive and slow; caching is fast but can route to instances that have vanished. The standard answer is to resolve on an interval (and/or on a change notification), cache the result, and keep it reasonably current — accepting a small staleness window in exchange for cheap per-request lookups. This is the same staleness/cost tension you will meet again in configuration (Part 3).
+
+### The Implementation (conceptually, in YARP)
+
+YARP models discovery behind a **destination resolver** interface. A destination configured with a hostname can be expanded into multiple concrete destination addresses by a resolver. The built-in **DNS resolver** periodically resolves configured host names into the live set of addresses, refreshing on an interval. Because resolution is behind an interface, you can plug in any source — a registry client, a custom API — and YARP will treat the resolved addresses as the cluster's destinations, feeding them into health checking and load balancing exactly as if they had been listed statically. (The Kubernetes ingress controller in Part 3 is a heavyweight, push-based form of this same idea.)
+
+---
+
+## 6. Transforms (Request and Response Rewriting)
+
+### The "Why"
+
+Recall from Part 1 that a proxy mediates *two* HTTP exchanges and must translate between them. Rarely is the outbound request a byte-for-byte copy of the inbound one. The backend may expect a different path, may need to be told the original client's IP, must not see certain client headers, and may add response headers the client should not. **Transforms** are YARP's general mechanism for *modifying requests on the way in and responses on the way out*.
+
+### The Theory
+
+A transform is conceptually a **function over the request (or response) context**: it receives the in-flight message and mutates it — adding, removing, or rewriting headers, path segments, or query parameters. The crucial design properties are **composability** and **ordering**: many small transforms chain together, and because some transforms depend on the effects of others, the order is significant. This is essentially a **middleware pipeline within the forwarding step** — a smaller echo of the request pipeline from Part 1.
+
+The most conceptually important transforms are the **forwarded-headers** transforms, because they encode a genuinely tricky distributed-systems truth: *once a proxy is in the path, the backend can no longer see the original client directly.* The original client IP, the original `Host`, and the original scheme (http/https) are all about the client↔proxy hop and would otherwise be lost. The transforms re-inject this information in one of two competing conventions:
+
+- The **`X-Forwarded-*`** family (`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Prefix`) — the older, de facto standard, where each proxy *appends* its view, building a chain.
+- The standardized **`Forwarded`** header (RFC 7239) — one header carrying the same facts in a structured form.
+
+YARP lets you choose which to emit and whether to append to or replace existing values. And here is the security crux: a forwarded header arriving *from the client* may be a **lie** — an attacker spoofing a trusted internal IP. So the correct behavior is to *not blindly trust* inbound forwarded headers and to control whether you append to them or overwrite them. The transform's "action" (append, set, remove, off) exists precisely to manage this trust boundary. This connects directly to the security discussion in Part 3.
+
+Beyond forwarded headers, transforms cover **path** rewriting (prefix removal, pattern-based rewrites), **query-parameter** manipulation (add from route values, add static, remove), **arbitrary header** add/remove/rewrite on both request and response, **HTTP method** changes, and forwarding the client's **TLS certificate** to the backend as a header. There are also **conditional** response transforms (only act when the response meets a condition) and **arbitrary function** transforms (run your own code), which is the ultimate escape hatch.
+
+### The Implementation (conceptually, in YARP)
+
+Transforms are built by **transform factories** that read declarative config (or fluent code) and produce concrete transform objects, which are then composed into a per-route transform pipeline. Request transforms run against a request-transform context just before forwarding; response transforms run against a response-transform context as the reply comes back. The default set already handles the correct, safe copying of headers (respecting the hop-by-hop vs. end-to-end distinction from Part 1) and the forwarded-headers conventions; you layer your custom transforms on top. As everywhere in YARP, factories and transforms are interfaces you can extend.
+
+---
+
+## 7. Cross-Cutting Request Controls: Rate Limiting, Timeouts, Concurrency, Authorization, CORS
+
+These are not destination-selection concerns; they are **policies applied to the request as it flows through the pipeline**, mostly reusing ASP.NET Core's own middleware and exposed per-route by YARP. Grouping them clarifies that YARP's job here is **integration, not reinvention**.
+
+**Rate limiting** protects backends from overload and abuse by capping how many requests a client (or route) may make in a time window. The classic algorithms are the **token bucket** (a bucket refills at a steady rate; each request spends a token; empty bucket means rejection — this naturally allows short bursts up to the bucket size), the **fixed window** (count per calendar window — simple but allows double-rate bursts at window boundaries), the **sliding window** (smooths the boundary problem), and **concurrency limiting** (cap simultaneous in-flight requests rather than rate over time). YARP exposes ASP.NET Core's rate-limiting middleware and lets each route select a named limiter policy.
+
+**Timeouts** bound how long the proxy will wait on a backend before giving up, so a hung backend cannot tie up resources indefinitely. A request timeout is selected per route. This pairs conceptually with passive health checking: a timeout is exactly the kind of failure signal that should also inform whether a destination is healthy.
+
+**Concurrency limits** (and request body size limits, etc.) protect the *proxy itself* from resource exhaustion — bounding how much work it will accept at once so it degrades gracefully under a flood rather than collapsing.
+
+**Authorization** decides whether a caller is *allowed* to reach a route at all, and **CORS** (Cross-Origin Resource Sharing) governs which web origins a browser may call the route from. Both are standard ASP.NET Core policies that YARP lets routes reference by name. The conceptual point — and a recurring exam question for proxy correctness — is **ordering**: authorization and rate limiting must run *before* the request is forwarded to a backend, never after. YARP's pipeline placement guarantees this.
+
+---
+
+## 8. Mental Sandbox
+
+1. **Pick a policy with a reason.** Service A serves cheap, uniform requests across 4 identical instances. Service B serves wildly variable requests (some take 5 ms, some take 5 s) across 40 instances. Service C has one primary and one warm standby. Which load-balancing policy fits each, and articulate *why* using the information-vs-cost trade-off from §2. For Service B, explain in one sentence why Power of Two Choices beats both Random and full Least-Requests at 40 instances.
+
+2. **Design the failure case.** You enable cookie session affinity for a checkout service that holds the cart in server memory. A user's affinitized backend crashes mid-checkout. Walk through what the affinity *failure policy* options (redistribute vs. 503) would each do, and argue which is correct here. Now change the scenario to a stateless service where affinity was only a cache optimization — does your answer flip? Why?
+
+3. **Trust the header or not.** Your proxy sits behind a cloud load balancer that *also* sets `X-Forwarded-For`, and directly receives traffic from the public internet on a second path. Explain why blindly appending to the inbound `X-Forwarded-For` is safe in one case and a spoofing vulnerability in the other, and how the transform "action" (append/set/off) lets you express the correct trust boundary for each ingress path.
+
+When these feel natural, move to **Part 3: Performance, Concurrency & Operations**, where we go under the hood — streaming, lock-free configuration swaps, observability, security, and running YARP in Kubernetes.
+# YARP Concepts — Part 3: Performance, Concurrency & Operations
+
+> Parts 1 and 2 covered *what* YARP does and *how it decides* where traffic goes. Part 3 goes under the hood to the concepts that make it **fast, safe under concurrency, observable, secure, and operable at scale**. These are the deepest ideas in the project, and the ones most likely to be new if your background is application code rather than systems engineering. Take them slowly — each section is a self-contained concept you could spend a career deepening.
+
+---
+
+## 1. The Forwarding Core: Streaming, Not Buffering
+
+### The "Why"
+
+The single hottest path in any proxy is the actual act of forwarding: read the request from the client, write it to the backend, read the response from the backend, write it back to the client. This happens for *every* request, often tens of thousands per second per node, and request/response bodies can be enormous (file uploads, video, large API payloads). The way you move those bytes determines whether your proxy is fast and memory-stable or slow and prone to running out of memory.
+
+### The Theory
+
+The naive approach — read the entire body into a buffer, then write the buffer — is catastrophic at proxy scale. A 1 GB upload would consume 1 GB of proxy memory; a thousand concurrent ones would consume a terabyte you do not have. The correct model is **streaming**: copy data in small fixed-size chunks from the source to the destination as it arrives, never holding more than one chunk in memory at a time. Memory use becomes *O(chunk size × concurrent requests)* instead of *O(body size × concurrent requests)*.
+
+This is the "move the bytes, don't process them" mindset from Part 1 in its purest form. The proxy is essentially a **pump** connecting two pipes. Several deeper performance ideas layer on top:
+
+- **Backpressure.** If the client is slow to receive but the backend is fast to send (or vice versa), you must not read faster than you can write, or buffers grow without bound. Proper stream copying naturally couples the two: you read the next chunk only after the previous one is written, so the fast side is throttled to the slow side's pace. This is **flow control**, and it is what keeps a streaming proxy memory-stable under mismatched speeds.
+
+- **Buffer reuse and avoiding allocations.** Allocating a fresh buffer per chunk per request creates immense **garbage-collection (GC)** pressure — in a managed runtime like .NET, allocations are cheap individually but ruinous in aggregate at this volume. High-performance .NET code rents buffers from a shared **array pool** and reuses them, and uses allocation-light types like `Span<T>` and `Memory<T>` (views over memory that don't copy) and `ArrayPool<T>`. When you read YARP's stream-copying code and see pooled buffers and span-based APIs, this is why: minimizing per-request allocation is minimizing GC pauses, which is minimizing tail latency.
+
+- **Duplex (bidirectional) copying for upgraded connections.** For WebSockets and other upgraded protocols (Part 1, §5.4), the request/response model is gone; you must pump bytes in *both directions simultaneously* until either side closes. That means two concurrent copy loops, with careful handling of which side closing means what.
+
+- **Asynchronous, non-blocking I/O.** A thread that blocks waiting for a slow network read is a thread doing nothing while consuming stack and scheduler resources. To handle tens of thousands of concurrent connections you cannot dedicate a thread to each. The model is **async I/O**: a small pool of threads services many connections by suspending a request's work when it is waiting on I/O and resuming it when data is ready. In .NET this is the `async`/`await` model over `Task`/`ValueTask`. Conceptually it is **cooperative concurrency**: thousands of logical operations in flight, mapped onto a handful of OS threads. This is *the* reason a single proxy node can serve so many connections, and it pervades every line of the forwarding path.
+
+### The Implementation (conceptually, in YARP)
+
+The forwarder reads the inbound request, applies transforms, and issues an outbound request using a pooled HTTP client (§2). Request and response bodies are moved by a **stream copier** that pumps fixed-size, pooled buffers between source and destination with backpressure, in an async loop. For upgraded connections it runs two copy loops for full-duplex traffic. The result of each copy is tracked as a structured outcome (success, canceled, the client gave up, the backend faulted) so that failures can be classified precisely — which feeds error reporting and the passive health checking from Part 2. The forwarder also distinguishes *stages* of the forwarding operation so telemetry can pinpoint exactly where time went or where a failure occurred.
+
+---
+
+## 2. The Outbound HTTP Client: Connection Pooling
+
+### The "Why"
+
+Every request the proxy forwards needs a connection to a backend. Opening a brand-new TCP connection (and a fresh TLS handshake) for every request would add tens of milliseconds and exhaust ports under load — a classic failure mode called **socket exhaustion**. The proxy must *reuse* connections aggressively.
+
+### The Theory
+
+The solution is **connection pooling**: keep a pool of open, warmed connections to each backend and hand them out for reuse, only opening new ones when the pool is empty. This amortizes the expensive TCP + TLS setup across many requests. With HTTP/2, a single pooled connection can carry many concurrent requests via multiplexing (Part 1, §5.3), so the pool can be small yet high-throughput. The pool must also handle connection lifetime (a connection held forever can become stale or pin to a backend that has since been replaced — so connections are recycled on a lifetime), and per-backend isolation (one slow backend must not starve connections to others).
+
+In .NET, this machinery is `SocketsHttpHandler` underneath `HttpClient`. A vital and counterintuitive lesson the platform learned the hard way: `HttpClient` is meant to be **long-lived and shared**, not created per request (creating one per request reintroduces socket exhaustion). YARP manages these clients carefully for exactly this reason.
+
+### The Implementation (conceptually, in YARP)
+
+YARP creates and configures outbound HTTP clients through a **forwarder HTTP client factory**, one logical client per cluster, configured from the cluster's HTTP-client settings (allowed protocol versions, timeouts, TLS/certificate options, whether to follow redirects, etc.). The factory is an interface you can replace to control client creation entirely. Because the client (and thus its connection pool) is per-cluster and reused across requests, the expensive setup cost is paid rarely and the pool stays warm.
+
+---
+
+## 3. The Heart of YARP: Immutable Snapshots and Lock-Free Configuration
+
+This is the most important concept in Part 3 and arguably in the whole project. It is where the "the world changes under me" mindset from Part 1 gets its rigorous solution. Read it twice.
+
+### The "Why"
+
+Recall that YARP's configuration — routes, clusters, destinations, and all their state (health, dynamic destination lists) — changes *continuously and concurrently with live request processing*. Thousands of requests are being routed right now, each reading the route table, the cluster's destination list, and each destination's health. Simultaneously, a config reload might be replacing routes, a DNS refresh might be changing destinations, and a health probe might be flipping a destination's status.
+
+The obvious approach — protect shared state with **locks** — is a disaster at this scale. Every request would contend on the lock to read the route table; the lock would become the bottleneck; and you would risk deadlocks and priority inversions. Worse, a request that reads the destination list, then reads health, then reads config could see an **inconsistent mix** — a destination from the old list judged against new health data — if those pieces changed between reads.
+
+### The Theory
+
+YARP's answer is a well-known but underused pattern: **immutability plus atomic reference swap**, giving **snapshot consistency** with essentially zero read-side synchronization. The idea has several interlocking parts:
+
+- **Immutable state.** Each piece of runtime state is an object that, once created, is *never modified*. A cluster's configuration, a route, a destination's health snapshot — all immutable. You never edit them in place.
+
+- **Change by replacement, not mutation.** When something changes, you do not mutate the old object; you build a *new* immutable object with the new values and **atomically swap a single reference** to point at it. An atomic reference swap is a single hardware-level operation that is indivisible — no reader can ever observe a half-updated reference; it sees either the entirely-old object or the entirely-new one, never a tear.
+
+- **Snapshot consistency for readers.** When a request begins, it reads the current references *once* and works against those snapshots for its entire lifetime. Even if a swap happens mid-request, the in-flight request keeps using the consistent snapshot it captured at the start. A new request arriving a microsecond later picks up the new snapshot. There is no locking, no blocking, and no possibility of mixing old and new state within one request. This is the "always the latest *and* consistent snapshot available when processing of a request starts" guarantee.
+
+- **Atomic primitives for the mutable bits.** A few things genuinely must be mutable counters shared across threads — e.g., the per-destination in-flight request count that Least-Requests load balancing reads (Part 2), or a passive health failure tally. These use **atomic operations** (lock-free `Interlocked`-style increments/reads) and small thread-safe holder types, rather than locks, so they too avoid contention.
+
+Why this is profound: it converts a hairy concurrency problem ("many readers, occasional writers, must stay consistent, must be fast") into a near-trivial one. Readers never coordinate with anyone. Writers never block readers. The only cost is allocating a new object on change — which is rare relative to reads — and a brief window where old and new snapshots coexist until in-flight requests drain. This is the same family of idea behind **read-copy-update (RCU)** in operating-system kernels and **persistent (immutable) data structures** in functional programming. If you internalize one systems concept from this whole series, make it this one.
+
+### The Implementation (conceptually, in YARP)
+
+YARP's runtime model is explicitly designed around this discipline. Its own internal documentation states the rule plainly: every runtime-state class must be immutable, or wrap an immutable value in an atomic holder, or be a thread-safe atomic counter. The model separates each abstraction (route, cluster, destination) into a stable identity object that holds atomic references to (a) the **config-derived** portion that changes only on config reload and (b) the **dynamic** portion that changes in reaction to runtime events (new destinations discovered, health changed). When config reloads, new config objects are built and the atomic holders are repointed; when health changes, a new dynamic-state object is built and swapped. Requests capture a feature object at the start that exposes the consistent snapshot for their entire duration. This is why YARP can hot-swap configuration "without explicit synchronization overhead across threads" — the architecture, not careful locking, is what makes it safe.
+
+---
+
+## 4. Configuration as a Pluggable, Hot-Reloadable Pipeline
+
+### The "Why"
+
+Part 1 established that configuration is a *living stream of snapshots* and can come from *anywhere*. Here is the machinery that makes both true, and why each piece exists.
+
+### The Theory
+
+A robust configuration system for a proxy needs four conceptual capabilities:
+
+1. **Abstraction of source.** "Where does config come from?" must be a replaceable detail. File, database, Kubernetes, a remote control plane — the proxy core shouldn't care. This is the classic **provider pattern**: an interface that yields the current config and a way to be notified of changes.
+
+2. **Change notification.** When the underlying source changes (the file is edited, the database row updates), the system must learn about it and produce a new snapshot. The standard .NET idiom is a **change token** — a lightweight signal that "the thing you're watching has changed, re-read it." A file-based provider, for instance, watches the file and raises a change token on edit.
+
+3. **Validation before adoption.** A bad config (a route pointing at a nonexistent cluster, a malformed path pattern, contradictory options) must be **rejected before it goes live**, not after it has started breaking requests. So there is a validation stage that checks routes and clusters for structural and semantic correctness, and refuses to swap in an invalid snapshot. This is a guardrail around the atomic-swap mechanism of §3: only *valid* snapshots get swapped in.
+
+4. **Filtering / transformation of config.** Sometimes you want to programmatically adjust config as it loads — inject defaults, rewrite values, merge sources. A **config filter** hook lets you intercept and modify the config on its way through.
+
+The deep payoff is **hot reload**: because adoption is just an atomic swap of a validated, immutable snapshot (§3), configuration can change while the server runs with zero downtime and zero dropped requests. The reload pipeline is: *source changes → change token fires → new config read → validated → filtered → new immutable model built → atomic swap → in-flight requests drain on the old snapshot, new requests use the new one.*
+
+### The Implementation (conceptually, in YARP)
+
+YARP defines a config-provider interface that returns the current config object together with a change token. It ships an **in-memory** provider (you push config from code — ideal when your own system manages topology) and supports a file/`IConfiguration`-based provider (declarative config that hot-reloads on edit). A config-validator component checks routes and clusters before adoption; a config-filter interface lets you transform config as it loads; and change listeners let other components react to reloads. All of these are interfaces — the same "swap in your own implementation" seam as everywhere else — so binding YARP to a bespoke control plane is a first-class, supported path rather than a hack.
+
+---
+
+## 5. Observability: Telemetry, Metrics, Tracing, and Logging
+
+### The "Why"
+
+A proxy sits at the most consequential point in your network — *every* request passes through it. That makes it the ideal vantage point for understanding system behavior, and it makes its *own* health and performance critical to observe. When something is slow or failing, "where did the time go, and which hop failed?" must be answerable. **Observability** is the set of concepts for making the system's internal state externally visible.
+
+### The Theory
+
+Observability rests on three classic **pillars**, plus a cross-cutting concern:
+
+- **Logs** — discrete, timestamped event records ("route X matched," "destination Y marked unhealthy"). High detail, high volume, good for *what happened* in a specific case.
+
+- **Metrics** — numeric aggregates over time (requests per second, error rate, p99 latency, active connection count). Cheap to collect and store, good for *trends, alerting, and dashboards*. The relevant idea is **structured, low-overhead counters and histograms** that can be scraped by a monitoring system.
+
+- **Traces** — the path of a *single request* across multiple services, broken into timed **spans**. This is what lets you see "the request spent 3 ms in the proxy, 200 ms in the backend, 190 ms of which was the database." For traces to span services, each hop must propagate a shared trace identity.
+
+- **Distributed-tracing context propagation.** This is the subtle, important one for a proxy. A trace only stays connected across the proxy→backend hop if the proxy *forwards the trace context*. The modern standard is **W3C Trace Context** (the `traceparent`/`tracestate` headers), which carry a trace ID and span ID. A correct proxy must propagate (and correctly extend) these headers so the backend's spans attach to the same trace. Doing this *wrong* — dropping or mangling the context — silently breaks end-to-end tracing across your whole platform, which is why YARP has dedicated propagation logic.
+
+A second platform-specific concept: **`EventSource` and `EventCounter`** are .NET's built-in, extremely low-overhead structured tracing/metrics mechanism. They let YARP emit fine-grained events (per forwarding stage, per WebSocket) that cost almost nothing when no one is listening but can be subscribed to by an in-process consumer or an external tool. This is the foundation of YARP's telemetry, and it integrates with **OpenTelemetry**, the vendor-neutral standard for collecting and exporting traces and metrics.
+
+### The Implementation (conceptually, in YARP)
+
+YARP instruments its pipeline with event sources that emit the forwarding **stages** (so you can see exactly where a request spent time or failed) and dedicated WebSocket telemetry (since upgraded connections need different measurements than request/response). A telemetry-consumption library lets you subscribe to these events in-process and turn them into metrics or traces. A propagator component carries distributed-tracing context across the proxy→backend hop so traces stay connected. The error path classifies failures into specific categories (request timeout, backend unreachable, client disconnected, body copy failed, …) and exposes them as a structured error feature, so logs and traces can say precisely *what* went wrong rather than "it failed." All of this is why a YARP node can be both deeply observable and observably cheap to observe.
+
+---
+
+## 6. Security at the Front Door
+
+### The "Why"
+
+As the public entry point to your infrastructure, the reverse proxy is your **primary security boundary**. It is where encryption is terminated, where untrusted input first arrives, and where many attacks are best stopped. Several concepts converge here.
+
+### The Theory
+
+- **TLS termination.** Clients connect over **HTTPS** (HTTP over TLS) for confidentiality and integrity. Decrypting (terminating) TLS at the proxy lets it read the request to route and transform it, and centralizes certificate management at one tier instead of every backend. The proxy may then talk to backends over plain HTTP (inside a trusted network) or re-encrypt (**TLS re-origination** / end-to-end TLS) for zero-trust environments. Understanding *where* TLS is terminated and whether the internal hop is encrypted is a core architectural decision the proxy embodies.
+
+- **Mutual TLS (mTLS) and client certificates.** Normal TLS authenticates the *server* to the client. **mTLS** additionally authenticates the *client* to the server via a client certificate — common for service-to-service and high-security scenarios. When the proxy terminates a client-certificate-authenticated connection, the backend can no longer see that certificate directly, so the proxy can forward it (e.g., as a header) — a specific transform exists for exactly this. (This is the same "the backend lost sight of the original client" problem as forwarded headers, applied to identity.)
+
+- **The forwarded-header trust boundary.** As stressed in Part 2, headers like `X-Forwarded-For` are security-sensitive: trusting a client-supplied one lets an attacker forge their apparent IP, defeat IP allow-lists, or poison logs. The proxy must decide which inbound forwarded headers to trust (only from known upstream proxies) and overwrite the rest. This is one of the most common real-world proxy misconfigurations, and YARP's per-action transforms exist to get it right.
+
+- **Authorization and CORS at the edge.** Stopping unauthorized or cross-origin requests at the proxy (Part 2, §7) prevents them from ever reaching — and loading — backends. The ordering guarantee (these run *before* forwarding) is itself a security property.
+
+- **Defense against resource-exhaustion attacks.** Limits on concurrency, request rate, body size, and timeouts (Part 2, §7) are not just performance tools; they are protections against denial-of-service. A proxy without them can be trivially overwhelmed.
+
+### The Implementation (conceptually, in YARP)
+
+Security in YARP is mostly about *correctly composing* the platform's robust primitives: Kestrel/HTTP.sys handle TLS and client-certificate negotiation; ASP.NET Core authorization and CORS policies are referenced per route; the data-protection system underpins encrypted session-affinity cookies (Part 2); the forwarded-header and client-certificate transforms manage the trust boundary and identity forwarding; and the limits/rate-limiting/timeout middleware bound resource use. YARP's contribution is placing these correctly in the pipeline and giving each route fine-grained, declarative control — so security is configured, auditable, and consistent rather than ad hoc.
+
+---
+
+## 7. Running at Scale: The Kubernetes Ingress Controller
+
+### The "Why"
+
+In a **Kubernetes** cluster, services and their backing instances (**pods**) are created, destroyed, and rescheduled constantly, and the cluster's desired routing is described declaratively in Kubernetes objects (like **Ingress** resources). Something must continuously translate "what Kubernetes says the routing should be" into "what the proxy is actually configured to do." YARP ships a **Kubernetes ingress controller** to be that something — a heavyweight, push-based form of the service discovery idea from Part 2.
+
+### The Theory
+
+This introduces one of the most important patterns in modern infrastructure: the **controller / reconciliation loop**, the foundation of Kubernetes itself.
+
+- **Declarative desired state vs. observed state.** You declare *what you want* (these routes, these services exposed). The controller's job is to observe *what currently is* and continuously drive the actual state toward the desired state. It never assumes a one-shot apply; it **reconciles** repeatedly, because reality drifts (pods die, specs change).
+
+- **The reconcile loop.** A controller **watches** the relevant Kubernetes objects, and whenever anything changes it recomputes the desired proxy configuration and applies it. The loop is *level-triggered*, not *edge-triggered*: it acts on the current total state, not on individual change events, so a missed or duplicated event cannot leave it permanently wrong. This idempotent, self-healing property is why the pattern is so robust.
+
+- **Informers, caches, and work queues.** Watching the Kubernetes API directly for every object would overwhelm it. The standard machinery is an **informer** that maintains a **local cache** of the watched objects (kept current via a watch stream) and feeds changes into a **work queue**. Workers pull from the queue and reconcile. The queue provides **rate limiting** and **deduplication** (collapsing a flurry of changes into one reconcile) so the controller stays efficient and the API server stays healthy. These exact concepts — caches, queues, rate limiters, informers — are why the controller's structure mirrors the broader Kubernetes ecosystem.
+
+- **Custom resources (CRDs).** Beyond standard Ingress objects, Kubernetes lets you define your own object types (**Custom Resource Definitions**) to express richer, YARP-specific routing intent. The controller watches these too.
+
+### The Implementation (conceptually, in YARP)
+
+The controller component watches Kubernetes Ingress (and related) resources through a cached, watch-based client, feeds changes into rate-limited work queues, and reconciles by **converting** the observed Kubernetes state into YARP's route/cluster/destination configuration. That generated configuration is then handed to a running YARP proxy through the same config-provider mechanism from §4 — so the proxy adopts it via the validated, atomic, hot-reload path of §3. In other words, the controller is "just another config source," and everything you learned about immutable snapshots and zero-downtime reload applies unchanged. This is the architecture paying off: a wildly dynamic source plugs into the same seam as a static file.
+
+---
+
+## 8. Two Advanced Topics Worth Knowing Exist
+
+These are specialized but conceptually illuminating; you do not need mastery, only awareness of the idea.
+
+**Tunneling.** Sometimes a backend lives on-premises behind a firewall that blocks inbound connections, but you want to reach it from the cloud. YARP's **tunnel** feature runs two cooperating proxies: an on-prem (back-end) proxy makes an *outbound* WebSocket connection to a cloud (front-end) proxy — outbound is allowed where inbound is blocked — and that long-lived connection is then used as a transport over which **HTTP/2 multiplexes** many proxied requests back to the on-prem services. Conceptually it inverts who-dials-whom to defeat the firewall, and reuses HTTP/2 multiplexing (Part 1) to carry many logical requests over one physical tunnel. The established tunnel appears to the front-end as a dynamically created **destination** of a cluster — so, once again, it reuses the core abstractions rather than inventing new ones.
+
+**HTTP.sys request delegation (Windows).** On Windows, the **HTTP.sys** kernel-mode server supports *handing off* a request to another process **at the kernel level**, so the actual response bypasses the proxy entirely on the return path. This is an extreme performance optimization for specific Windows scenarios: instead of streaming the response back through YARP, YARP delegates the connection and steps out of the data path. It is niche, but it illustrates a general principle worth absorbing — the fastest proxy work is the work you can arrange *not* to do.
+
+---
+
+## 9. Mental Sandbox & Next Steps
+
+You now have the full conceptual map. These closing challenges are deliberately open-ended — they are the kind of design reasoning that real YARP work demands.
+
+1. **Defend the lock-free model.** Explain to a skeptical colleague who "just wants to put a lock around the config" why YARP uses immutable snapshots and atomic reference swaps instead. Cover: read-side cost, writer/reader contention, and — most importantly — the *consistency* guarantee for a request that spans a config change. Then identify the one category of state that genuinely *can't* be immutable (hint: §3) and explain how YARP handles it without locks.
+
+2. **Trace a slow request.** A user reports a request that takes 4 seconds. Using the observability concepts from §5, lay out exactly how you would localize the delay: which signals (forwarding stages, traces, metrics, error feature) would distinguish "slow backend" from "exhausted connection pool" from "the proxy is GC-pausing" from "TLS handshake storm." Note where W3C trace-context propagation is essential to even see the backend's portion.
+
+3. **Add a new config source.** Suppose your company has a custom service registry with a streaming change API. Sketch — conceptually, no code — how you would feed it into YARP. Which interface from §4 do you implement? How does your source signal changes? Where does validation happen? At what exact moment does a new destination become eligible for traffic, and which mechanism from §3 guarantees no in-flight request is disrupted when it does? If you can answer this cleanly, you understand how the Kubernetes controller (§7), the DNS resolver (Part 2), and the file provider are all the *same idea* wearing different clothes — and you are ready to open the source with confidence.
+
+---
+
+### Where to go from here
+
+You have covered: the nature of a reverse proxy and its protocols (Part 1); routing, load balancing, health, affinity, discovery, and transforms (Part 2); and streaming, connection pooling, lock-free configuration, observability, security, and Kubernetes operation (Part 3). When you open the code, anchor yourself with the three core abstractions (Route, Cluster, Destination) and the request lifecycle, and remember that almost every type you meet is either an *immutable snapshot*, a *pluggable interface (a seam)*, or a *middleware stage in the pipeline*. Those three shapes account for the overwhelming majority of the design. Welcome to the project — you are ready.

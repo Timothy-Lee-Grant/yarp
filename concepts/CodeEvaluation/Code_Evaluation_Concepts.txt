@@ -1,0 +1,1076 @@
+# Code Evaluation — Part 00: How Professionals Structure a .NET Project
+
+> **Purpose of this series.** You've built plenty of personal projects. This series shows you what *production .NET engineered by Microsoft* looks like up close, using YARP's real code, so that when you walk into a mid-level role at a big company you already recognize the craft and conventions. Part 00 is about everything *around* the code — the build system, project configuration, and the disciplines a serious repo enforces before a single feature is written. These are exactly the things personal projects skip and professional ones live by.
+>
+> **How to use it.** Open the referenced files in the repo as you read. The goal is recognition: "ah, *that's* why that's there." Each section ends with a **why it matters professionally** note tied to your goal of being job-ready.
+
+---
+
+## 1. The Layered Build System (`Directory.Build.props` / `.targets`)
+
+In a personal project, build settings live in each `.csproj`, copy-pasted and drifting apart. YARP uses MSBuild's **directory-scoped property files**, which apply automatically to every project at or below their folder. There's a hierarchy:
+
+```
+/Directory.Build.props            ← repo-wide defaults (lang version, signing, determinism)
+/src/Directory.Build.props        ← settings for all shipping libraries (packaging, docs)
+/src/ReverseProxy/Yarp.ReverseProxy.csproj  ← per-project specifics only
+```
+
+The child explicitly imports its parent so the chain composes:
+
+```xml
+<!-- src/Directory.Build.props -->
+<Import Project="$(MSBuildThisFileDirectory)..\Directory.Build.props" />
+```
+
+The repo-root `Directory.Build.props` sets things *once* for the whole solution:
+
+```xml
+<LangVersion>12.0</LangVersion>
+<Deterministic>true</Deterministic>
+<EmbedUntrackedSources>true</EmbedUntrackedSources>
+<IncludeSymbols>true</IncludeSymbols>
+<StrongNameKeyId>Microsoft</StrongNameKeyId>
+```
+
+**What each buys you:**
+
+- **`Deterministic`** — the same source always produces a byte-for-byte identical binary. This is the bedrock of *reproducible builds*: a build on your laptop and on the CI server are provably the same artifact, which matters for security (supply-chain verification) and debugging.
+- **`EmbedUntrackedSources` + `IncludeSymbols`** — ships debugging symbols and source info so customers can step into the library with a debugger (Source Link). Personal projects never bother; products must.
+- **`StrongNameKeyId`** — the assembly is cryptographically **strong-named** (signed), required for some enterprise/GAC scenarios and for verifiable identity.
+
+> **Why it matters professionally:** the first thing that surprises engineers joining a big company is that "the build" is a real, owned, sophisticated system. Knowing that settings cascade through `Directory.Build.props` means you won't be lost when you need to change a compiler flag for 40 projects at once. This is table-stakes fluency.
+
+---
+
+## 2. Multi-Targeting (`TFMs.props`)
+
+Personal projects target one framework. Libraries shipped to the world must run on several. YARP centralizes its **Target Framework Monikers (TFMs)** in one file:
+
+```xml
+<!-- TFMs.props -->
+<LatestDevTFM>net9.0</LatestDevTFM>
+<ReleaseTFMs>net8.0</ReleaseTFMs>
+<TestTFMs>net8.0;net9.0</TestTFMs>
+```
+
+And the library consumes them:
+
+```xml
+<!-- Yarp.ReverseProxy.csproj -->
+<TargetFrameworks>$(ReleaseTFMs)</TargetFrameworks>
+```
+
+**The concept:** a single codebase is compiled separately for each listed framework. Tests run on *both* net8.0 and net9.0 (`TestTFMs`) to guarantee the library behaves on the LTS release customers depend on *and* the newest one. Centralizing the moniker list means a framework bump is a one-line change, not a 30-file find-and-replace.
+
+> **Why it matters professionally:** "support matrix" thinking is foreign to hobby projects and central to product work. You'll be asked "does this run on the LTS?" and multi-targeting + a test matrix is the answer. Recognize `$(ReleaseTFMs)` and you understand the project's support commitment at a glance.
+
+---
+
+## 3. The Project File Is a Declaration of Intent (`Yarp.ReverseProxy.csproj`)
+
+Read this small file like a résumé of professional choices:
+
+```xml
+<PropertyGroup>
+  <TargetFrameworks>$(ReleaseTFMs)</TargetFrameworks>
+  <Nullable>enable</Nullable>
+  <IsAotCompatible>true</IsAotCompatible>
+  <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  <GenerateDocumentationFile>true</GenerateDocumentationFile>  <!-- from src/Directory.Build.props -->
+</PropertyGroup>
+
+<ItemGroup>
+  <InternalsVisibleTo Include="DynamicProxyGenAssembly2" Key="$(MoqPublicKey)" />
+  <InternalsVisibleTo Include="Yarp.ReverseProxy.Tests" />
+  <InternalsVisibleTo Include="Yarp.ReverseProxy.FunctionalTests" />
+</ItemGroup>
+
+<ItemGroup>
+  <FrameworkReference Include="Microsoft.AspNetCore.App" />
+</ItemGroup>
+```
+
+Four professional signals worth dwelling on:
+
+**`<Nullable>enable</Nullable>`** — turns on **nullable reference types**, the single most important modern-C# safety feature. The compiler now tracks which references can be `null` and warns you when you might dereference one. This is why you'll see `DestinationState?` (nullable) vs `DestinationState` (non-null) all over the code — those `?`s are *contracts the compiler enforces*. It eliminates a whole class of `NullReferenceException` bugs at compile time. **Adopt this habit immediately**; it's the expected default in any modern .NET shop.
+
+**`<IsAotCompatible>true</IsAotCompatible>`** — the library promises to work with **Native AOT** (ahead-of-time compilation to a native binary with no JIT). This forbids certain runtime tricks (unbounded reflection, runtime code-gen) and is enforced by analyzers. You'll see `[DynamicallyAccessedMembers(...)]` attributes (in the DI extensions) precisely to satisfy AOT/trimming analysis. AOT-awareness is increasingly expected for cloud/container libraries.
+
+**`<InternalsVisibleTo>`** — grants specific *other* assemblies access to this assembly's `internal` members. Two uses here: the test projects (so unit tests can test internals without making them public), and `DynamicProxyGenAssembly2` keyed by `$(MoqPublicKey)` (so the Moq mocking library can subclass internal types). This is the professional answer to "how do I test internal code without polluting my public API?" — you don't make it public, you whitelist your test assembly.
+
+**`<FrameworkReference Include="Microsoft.AspNetCore.App" />`** — depends on the *entire ASP.NET Core shared framework* rather than dozens of individual NuGet packages. This is how ASP.NET-adjacent libraries avoid version-conflict hell.
+
+> **Why it matters professionally:** a mid-level engineer is expected to *read a csproj and understand the product's posture* — its framework support, its safety settings, its testability strategy. This file tells you YARP is null-safe, AOT-ready, strongly-tested, and ASP.NET-native, before you read one line of C#.
+
+---
+
+## 4. The Public API Is a Guarded Boundary
+
+Notice the access modifiers in the code you'll read: the vast majority of classes are **`internal sealed`**, while only the intended extension points are `public`. Examples:
+
+```csharp
+internal sealed class PowerOfTwoChoicesLoadBalancingPolicy : ILoadBalancingPolicy   // hidden
+public interface ILoadBalancingPolicy { ... }                                        // exposed
+```
+
+This is deliberate **API surface minimization**. Everything public is a *forever promise* — once shipped, you can't change it without breaking customers (semantic versioning). So professionals expose the *minimum*: the interfaces you're meant to implement and the registration methods you're meant to call. Implementations stay `internal sealed` so the team can rewrite them freely between versions.
+
+- **`internal`** → invisible outside the assembly (but visible to tests via `InternalsVisibleTo`).
+- **`sealed`** → cannot be inherited. This is both a performance win (the JIT can devirtualize calls) and a design statement ("don't extend this; implement the interface instead").
+
+> **Why it matters professionally:** the discipline of "public is a contract; default to internal" is a hallmark of library engineers and a frequent code-review comment at companies like Microsoft. In personal projects everything is `public` by reflex. Breaking that reflex is a concrete level-up.
+
+---
+
+## 5. Code Style Is Mechanically Enforced (`.editorconfig`, analyzers, `.globalconfig`)
+
+The repo root has a large `.editorconfig` and `eng/CodeAnalysis.*.globalconfig` files. These encode the team's style and correctness rules — naming, `var` usage, brace placement, banned APIs, nullable strictness — and the compiler/analyzers **fail the build** when violated. There's even a `.markdownlint.json` for docs.
+
+The point: **style is not a matter of opinion or PR bickering; it's automated.** Everyone's code looks the same because a machine enforces it. **Roslyn analyzers** (static analysis that runs during compilation) catch real bugs too — disposed-object misuse, AOT-incompatible patterns, etc.
+
+> **Why it matters professionally:** at a big company you will *not* argue about tabs vs spaces; the `.editorconfig` decides and the CI gate enforces it. Knowing this exists means your first PR won't be a wall of style nits. Run the build locally, fix what the analyzers flag, *then* push.
+
+---
+
+## 6. Everything Reproducible: SDK Pinning (`global.json`) and Arcade
+
+`global.json` pins the exact .NET SDK version. The `restore` script downloads *that* SDK into a repo-local `.dotnet/` folder. The `eng/common/` Arcade scripts standardize the build across all of Microsoft's .NET repos.
+
+The principle is **hermetic, reproducible builds**: every developer and the CI server use the *identical* toolchain, pinned in source control. No "works on my machine" caused by SDK drift — a problem you know well from embedded toolchains.
+
+> **Why it matters professionally:** "the build is code, pinned and reproducible" is a core DevOps value. Recognizing `global.json` + Arcade means you'll know *why* you must run `restore` before `build`, and why the repo ships its own SDK rather than using your system one.
+
+---
+
+## 7. The Mental Checklist You Should Internalize
+
+When you join a professional .NET codebase, scan for these in order — YARP has all of them, and so will your employer's repo:
+
+| Look for | In YARP | Tells you |
+| --- | --- | --- |
+| Layered `Directory.Build.props` | yes | How settings cascade; where to change them |
+| Centralized TFMs + test matrix | `TFMs.props` | The support commitment |
+| `<Nullable>enable</Nullable>` | yes | Null-safety is enforced; respect the `?`s |
+| `<IsAotCompatible>` / trimming attrs | yes | Reflection is constrained; watch the analyzers |
+| `internal sealed` by default | pervasive | Minimal public surface; extend via interfaces |
+| `InternalsVisibleTo` tests | yes | How internals get tested |
+| `.editorconfig` + analyzers + `.globalconfig` | yes | Style/correctness is automated; don't fight it |
+| `global.json` + a `restore` step | yes | Reproducible, pinned toolchain |
+| Deterministic + Source Link + symbols | yes | Debuggable, verifiable releases |
+
+> **The big takeaway:** professional .NET projects front-load an enormous amount of *invisible discipline* — null-safety, reproducibility, enforced style, guarded API surface, AOT-readiness — before any feature exists. Personal projects skip all of it. Closing that gap in your own work (start with `Nullable enable`, `internal` by default, and an `.editorconfig`) is the fastest way to *look and operate* like a mid-level engineer.
+
+Next: **Part 01 — The C# language features and performance techniques** YARP uses in its hot paths, with the real `StreamCopier`, `AtomicCounter`, and `ValueStringBuilder` code.
+# Code Evaluation — Part 01: C# Language Features & High-Performance Techniques
+
+> This is where YARP will most expand you as a programmer. A reverse proxy lives or dies on throughput, so its hot paths use the *advanced, performance-oriented* corner of C# that most application developers never touch — and that big-company interviewers love to probe. Coming from embedded C/C++, much of this will feel familiar (manual buffers, avoiding allocations, memory layout) which is an advantage. We'll use YARP's real code to teach each technique.
+>
+> **The mental frame:** in a garbage-collected runtime, the enemy of throughput is **allocation** (every `new` object eventually costs a GC pause) and **copying**. The techniques below all serve one goal: *do the work without allocating or copying*.
+
+---
+
+## 1. `Span<T>` and `Memory<T>`: Windows Over Memory Without Copying
+
+`Span<T>` is the most important modern-C# type to understand. It's a **view** over a contiguous block of memory — an array, part of an array, stack memory, or unmanaged memory — that lets you read/write it **without copying and without knowing where it lives**. Think of it as a safe, bounds-checked C pointer+length.
+
+From `StreamCopier` (the proxy's hottest loop):
+
+```csharp
+read = await input.ReadAsync(buffer.AsMemory(), cancellation);
+...
+await output.WriteAsync(buffer.AsMemory(0, read), cancellation);
+```
+
+`buffer.AsMemory(0, read)` creates a `Memory<byte>` describing "bytes 0..read of this buffer" — **no new array, no copy**. The write consumes exactly those bytes.
+
+**`Span<T>` vs `Memory<T>` — the distinction you must know:**
+
+| | `Span<T>` | `Memory<T>` |
+| --- | --- | --- |
+| Where it can live | stack only (it's a `ref struct`) | anywhere (heap, fields, async state) |
+| Can be used across `await`? | **No** | **Yes** |
+| Use it for | synchronous, tight loops | async I/O, storing for later |
+
+That's why `StreamCopier` uses `Memory<byte>` — it crosses `await` boundaries (async I/O). Synchronous parsing code (like `ValueStringBuilder`, §5) uses `Span<char>`. This rule — *Span for sync, Memory for async* — trips up many intermediate developers; knowing it cold marks you as fluent.
+
+> **Embedded parallel:** `Span<T>` is the managed-world version of passing `(ptr, len)` instead of copying a buffer. You already think this way in C; C# now lets you do it *safely*.
+
+---
+
+## 2. `ArrayPool<T>`: Reusing Buffers Instead of Allocating Them
+
+Allocating a 64 KB buffer per request, for thousands of requests per second, would bury the GC. Instead YARP **rents** buffers from a shared pool and returns them:
+
+```csharp
+var buffer = ArrayPool<byte>.Shared.Rent(DefaultBufferSize);   // 65536
+try
+{
+    // ... use buffer ...
+}
+finally
+{
+    if (buffer is not null)
+    {
+        ArrayPool<byte>.Shared.Return(buffer);                 // give it back
+    }
+}
+```
+
+`ArrayPool<T>.Shared` is a process-wide pool of reusable arrays. `Rent` gives you one (possibly larger than asked); `Return` puts it back for the next caller. The buffer is **reused** across millions of requests instead of allocated-then-collected each time. This converts a stream of GC garbage into a small fixed set of long-lived arrays.
+
+Notice the **discipline** the code shows around it:
+
+```csharp
+// Take care not to return the same buffer to the pool twice in case zeroByteReadTask throws
+var bufferToReturn = buffer;
+buffer = null;
+ArrayPool<byte>.Shared.Return(bufferToReturn);
+```
+
+Pooling is powerful but *dangerous*: return a buffer twice, or use it after returning, and you get memory corruption-class bugs (two callers writing the same array). The careful `buffer = null` dance and the `if (buffer is not null)` in `finally` exist to make double-return impossible. **This rent/return ownership rigor is exactly the manual-memory discipline you know from C** — applied in a GC language for speed.
+
+> **Interview gold:** "How would you avoid GC pressure in a high-throughput service?" → pooled buffers via `ArrayPool<T>`, reused across requests, with strict return-once ownership. This single example answers it.
+
+---
+
+## 3. The Zero-Byte Read Trick: Allocating Even Later
+
+This is a subtle, beautiful optimization most developers have never seen:
+
+```csharp
+// Issue a zero-byte read to the input stream to defer buffer allocation until data is available.
+var zeroByteReadTask = input.ReadAsync(Memory<byte>.Empty, cancellation);
+if (zeroByteReadTask.IsCompletedSuccessfully) { ... }
+else
+{
+    // return the rented buffer to the pool while we WAIT for data
+    ArrayPool<byte>.Shared.Return(bufferToReturn);
+    await zeroByteReadTask;        // park here with NO buffer held
+    buffer = ArrayPool<byte>.Shared.Rent(DefaultBufferSize);  // re-rent only when data is ready
+}
+```
+
+**The insight:** a proxy may hold tens of thousands of *idle* connections waiting for data. If each idle connection held a 64 KB buffer, that's gigabytes of RAM doing nothing. By issuing a **zero-byte read** (which completes only when data is actually available) and *releasing the buffer while waiting*, YARP holds buffers only for connections with data ready to move. At scale this is an enormous memory saving.
+
+> **Why it matters:** this is the kind of optimization that separates "works" from "works at 100k connections." Understanding *why* it exists — buffer-per-idle-connection is the enemy — is more valuable than memorizing it.
+
+---
+
+## 4. `ValueTask<T>`: Avoiding Allocation in the Async Hot Path
+
+Every `async` method that returns `Task<T>` allocates a `Task` object. For a method called millions of times that *usually completes synchronously* (data already buffered), that allocation is wasteful. `ValueTask<T>` avoids it: it's a `struct` that holds *either* a synchronous result *or* a `Task` when it truly needs to go async.
+
+YARP returns `ValueTask` throughout the forwarder:
+
+```csharp
+public ValueTask<ForwarderError> SendAsync(...)
+public static ValueTask<(StreamCopyResult, Exception?)> CopyAsync(...)
+```
+
+When the operation completes synchronously (common case), **no `Task` is allocated** — the result rides inside the struct. Only when it genuinely suspends does it cost more.
+
+**The catch you must know:** a `ValueTask` may be awaited **only once**, and you must not access its `.Result` before it completes. That's why you'll see careful handling like:
+
+```csharp
+if (zeroByteReadTask.IsCompletedSuccessfully)
+{
+    _ = zeroByteReadTask.Result;   // consume it exactly once
+}
+```
+
+> **Rule of thumb (interview-ready):** return `ValueTask` from hot-path async methods that often complete synchronously; return `Task` for everything else. Never await a `ValueTask` twice.
+
+---
+
+## 5. `ref struct` + `stackalloc`: Building Strings Without the Heap
+
+`ValueStringBuilder` assembles strings on the **stack** for short inputs, only falling back to a pooled heap array when they grow large:
+
+```csharp
+internal ref partial struct ValueStringBuilder
+{
+    public const int StackallocThreshold = 512;
+    private char[]? _arrayToReturnToPool;   // rented only if we overflow the stack buffer
+    private Span<char> _chars;               // the current backing store (stack or pooled)
+    private int _pos;
+```
+
+Used (conceptually) like:
+
+```csharp
+Span<char> initialBuffer = stackalloc char[256];   // lives on the stack — zero heap allocation
+var sb = new ValueStringBuilder(initialBuffer);
+sb.Append(...);
+string result = sb.ToString();                      // copies out once; disposes the buffer
+```
+
+Three advanced concepts in one type:
+
+- **`stackalloc`** allocates a buffer on the *stack*, not the heap — instant, no GC, automatically freed when the method returns. (You know this as a stack array in C.)
+- **`ref struct`** is a struct the compiler *guarantees* stays on the stack — it can never be boxed, stored in a field, or captured across `await`. That guarantee is what makes it safe to hold a `Span<char>` over `stackalloc` memory.
+- **Graceful overflow**: if the string exceeds the stack buffer, it rents from `ArrayPool` and copies over — so it's fast in the common (small) case and still correct in the rare (large) case.
+
+The `Append` method even shows micro-optimization:
+
+```csharp
+[MethodImpl(MethodImplOptions.AggressiveInlining)]
+public void Append(char c)
+{
+    var pos = _pos;
+    var chars = _chars;
+    if ((uint)pos < (uint)chars.Length)   // single unsigned compare = bounds check
+    {
+        chars[pos] = c;
+        _pos = pos + 1;
+    }
+    ...
+}
+```
+
+`[MethodImpl(AggressiveInlining)]` asks the JIT to inline this tiny method into its callers (no call overhead). The `(uint)pos < (uint)chars.Length` trick does a bounds check with a *single* unsigned comparison (a negative `pos` becomes a huge `uint`, failing the check) — a classic performance idiom you'll see throughout the .NET runtime.
+
+> **Embedded parallel:** this is stack buffers + manual bounds checks + forced inlining — your daily bread in firmware, now expressed in C#. You're well-positioned to *get* this faster than a typical web developer.
+
+---
+
+## 6. `struct` Value Types to Avoid Allocation: `ValueStopwatch`
+
+A normal `Stopwatch` is a class — using one per request allocates. `ValueStopwatch` is a `struct` that measures elapsed time with zero allocation:
+
+```csharp
+internal struct ValueStopwatch
+{
+    private readonly long _startTimestamp;
+    private ValueStopwatch(long startTimestamp) => _startTimestamp = startTimestamp;
+
+    public static ValueStopwatch StartNew() => new ValueStopwatch(Stopwatch.GetTimestamp());
+
+    public TimeSpan Elapsed
+    {
+        get
+        {
+            if (_startTimestamp == 0)   // default(ValueStopwatch) guard
+                throw new InvalidOperationException("...uninitialized...");
+            var delta = Stopwatch.GetTimestamp() - _startTimestamp;
+            return new TimeSpan((long)(_timestampToTicks * delta));
+        }
+    }
+}
+```
+
+It stores a single `long` (a raw timestamp) and computes elapsed time on demand. Because it's a `struct`, declaring one is free — it lives inline in its containing frame/object, no heap object, no GC. Note the **defensive guard**: a `default(ValueStopwatch)` has `_startTimestamp == 0`, which is detected and rejected, because value types can be created uninitialized (you can't force a constructor to run on a struct).
+
+> **The lesson:** when a small, short-lived helper would otherwise allocate, make it a `struct`. The trade-off (structs are copied by value, can be created uninitialized) requires care — hence the guard.
+
+---
+
+## 7. Lock-Free Counters: `AtomicCounter` and `Interlocked`
+
+The load balancer needs each destination's live in-flight request count, read and written by many threads at once. A lock would serialize the hot path. Instead, `AtomicCounter` uses **atomic CPU instructions**:
+
+```csharp
+internal sealed class AtomicCounter
+{
+    private int _value;
+
+    public int Value
+    {
+        get => Volatile.Read(ref _value);      // guaranteed to see latest value
+        set => Volatile.Write(ref _value, value);
+    }
+
+    public int Increment() => Interlocked.Increment(ref _value);   // atomic ++ across threads
+    public int Decrement() => Interlocked.Decrement(ref _value);
+    public void Reset()     => Interlocked.Exchange(ref _value, 0);
+}
+```
+
+- **`Interlocked.Increment`** performs `++` as a *single indivisible hardware operation*, so two threads incrementing simultaneously can never lose an update (the classic race). No lock needed.
+- **`Volatile.Read/Write`** prevents the compiler/CPU from caching or reordering the read/write, so one thread's update is promptly visible to others (memory-ordering correctness).
+
+> **Interview relevance:** "How do you increment a shared counter from many threads without a lock?" → `Interlocked`. "Why `Volatile`?" → visibility/ordering across cores. This is core concurrency literacy, and YARP shows it in 40 clean lines.
+
+---
+
+## 8. Putting Allocation-Avoidance Together: the `StreamCopier` Loop
+
+Step back and see how the techniques compound in *one* method (Components Part 02 §8). The proxy's central byte-pump:
+
+1. **Rents** a 64 KB buffer from `ArrayPool` (no allocation).
+2. Issues a **zero-byte read** to defer buffer use until data is ready (memory saving at scale).
+3. Reads into a **`Memory<byte>`** view (no copy).
+4. Returns a **`ValueTask`** with a **tuple** `(StreamCopyResult, Exception?)` — structured result without throwing for control flow, without allocating a result object.
+5. **Returns** the buffer in `finally`, with **return-once** safety.
+6. Optionally records timing via the lightweight telemetry helper, gated on whether anyone's listening.
+
+```csharp
+return (StreamCopyResult.InputError,
+        new InvalidOperationException("More bytes received than the specified Content-Length."));
+```
+
+That **tuple return** (`(StreamCopyResult, Exception?)`) is itself a pattern: instead of *throwing* for an expected failure (exceptions are expensive and meant for the *exceptional*), it returns a structured outcome the caller pattern-matches on. Using return values for expected failures and exceptions only for truly unexpected ones is a professional habit.
+
+> **The synthesis:** every line is chosen so the per-request, per-chunk cost is *near zero allocation*. This is what "high-performance .NET" actually means in practice — not clever algorithms, but relentless elimination of allocation and copying on the hot path.
+
+---
+
+## 9. A Few More Idioms You'll See (quick hits)
+
+| Idiom (real YARP usage) | What it does | Why pros use it |
+| --- | --- | --- |
+| `ConditionalWeakTable<ClusterState, AtomicCounter>` (RoundRobin) | Attaches per-cluster state without leaking memory when the cluster is GC'd | Associates data with objects you don't own, GC-safely |
+| `(offset & 0x7FFFFFFF) % count` (RoundRobin) | Masks the sign bit to keep an index non-negative after `int` overflow | Correctness under integer wraparound — firmware thinking |
+| `Debug.Assert(input is not null)` | Checks invariants in debug builds only (free in release) | Document + verify assumptions without release cost |
+| `is not null` / `is { }` pattern matching | Modern null/type checks | Readability; the idiomatic modern style |
+| `??=` (`RequestUri ??= ...`) | Assign only if currently null | Concise conditional initialization |
+| `[MethodImpl(AggressiveInlining)]` | Force-inline a tiny hot method | Remove call overhead in loops |
+
+The `ConditionalWeakTable` one is especially worth studying: `RoundRobinLoadBalancingPolicy` must keep a rotating counter *per cluster*, but it must not keep clusters alive forever (a memory leak) once they're removed from config. A `ConditionalWeakTable` holds its keys *weakly*, so when a cluster is collected its counter vanishes too. That's a sophisticated lifetime-management choice most developers don't know exists.
+
+---
+
+## 10. Your Practice Path
+
+To convert reading into skill:
+
+1. **Re-implement `ValueStopwatch` and `AtomicCounter` from memory.** They're small and teach `struct` semantics and `Interlocked`.
+2. **Write a tiny stream-copy method** using `ArrayPool` + `Memory<byte>` + `ValueTask`, with correct rent/return. This single exercise touches half this document.
+3. **Turn on `<Nullable>enable</Nullable>` in one of your projects** and fix every warning. You'll feel the design pressure that produces YARP's `?`-annotated APIs.
+4. **Benchmark it.** Add [BenchmarkDotNet] (the standard .NET micro-benchmark library; YARP has a `BenchmarkApp`) and measure allocations with and without pooling. *Seeing* the allocation drop is what makes it stick.
+
+> **Bottom line:** your embedded background is a genuine edge here — buffer ownership, stack allocation, bounds checks, and atomics are your native language. YARP shows you the *idiomatic C# expression* of instincts you already have. Master this document and you'll out-perform many web-first developers on exactly the topics big-company systems teams care about.
+
+Next: **Part 02 — the design patterns** that organize all this code: DI, Strategy, Factory, Builder, Middleware, Null-Object, Decorator, and Adapter.
+# Code Evaluation — Part 02: Design Patterns You Should Learn From This Code
+
+> Design patterns are the vocabulary senior engineers use to discuss structure. YARP is an unusually clean catalog of them because its entire reason for existing — *be customizable* — forces disciplined, pattern-based design. This document walks the patterns that actually appear in the code, each with the real YARP example, what problem it solves, and how to recognize and reuse it. Learn to *name* these and you'll communicate like a senior engineer in design reviews and interviews.
+>
+> A theme to hold: most of these patterns are different answers to one question — **"how do I let behavior be swapped out without rewriting the code that uses it?"** That is the heart of extensible software.
+
+---
+
+## 1. Dependency Injection (DI) — the pattern everything else rides on
+
+**Problem it solves:** a class needs collaborators (a logger, a clock, a policy). If it `new`s them itself, it's welded to specific implementations — untestable and inflexible. **Dependency Injection** inverts this: a class *declares* what it needs (usually via constructor parameters typed as interfaces), and a container *supplies* concrete instances at runtime.
+
+YARP's `PowerOfTwoChoicesLoadBalancingPolicy` doesn't create its randomness source; it asks for one:
+
+```csharp
+internal sealed class PowerOfTwoChoicesLoadBalancingPolicy : ILoadBalancingPolicy
+{
+    private readonly IRandomFactory _randomFactory;
+
+    public PowerOfTwoChoicesLoadBalancingPolicy(IRandomFactory randomFactory)  // injected
+    {
+        _randomFactory = randomFactory;
+    }
+    ...
+}
+```
+
+The **container** (Microsoft.Extensions.DependencyInjection) is configured in the registration methods:
+
+```csharp
+services.TryAddSingleton<IHttpForwarder, HttpForwarder>();
+services.TryAddSingleton(TimeProvider.System);
+```
+
+`TryAddSingleton<IHttpForwarder, HttpForwarder>()` means "when anyone asks for `IHttpForwarder`, give them one shared `HttpForwarder`." Two professional details:
+
+- **`TryAdd...`** registers *only if not already registered*. This lets a user override a default by registering their own implementation *first* — the mechanism behind YARP's "customize anything." Plain `Add` would clobber a user's choice; `TryAdd` respects it.
+- **Lifetimes** (`Singleton`, `Scoped`, `Transient`) declare how long an instance lives. `Singleton` = one for the app; `Scoped` = one per request; `Transient` = a fresh one each time. Choosing correctly is a common source of real bugs (e.g., capturing request state in a singleton).
+
+> **Why it matters:** DI *is* how modern .NET apps are wired. Every class you see taking interfaces in its constructor is participating. Internalize "depend on interfaces, let the container supply them" — it's the precondition for testability (Part 04) and for every other pattern below.
+
+---
+
+## 2. Strategy / Policy — interchangeable algorithms behind one interface
+
+**Problem it solves:** you have several ways to do the same job (pick a destination) and want to choose at runtime/config time without `if/switch` sprawl. **Strategy** defines one interface and many implementations; callers depend only on the interface.
+
+YARP's load-balancing policies are a textbook Strategy:
+
+```csharp
+public interface ILoadBalancingPolicy
+{
+    string Name { get; }   // how config refers to this strategy
+    DestinationState? PickDestination(HttpContext context, ClusterState cluster,
+                                      IReadOnlyList<DestinationState> availableDestinations);
+}
+```
+
+Implementations — `RoundRobinLoadBalancingPolicy`, `RandomLoadBalancingPolicy`, `PowerOfTwoChoicesLoadBalancingPolicy`, `LeastRequestsLoadBalancingPolicy`, `FirstLoadBalancingPolicy` — each encapsulate one algorithm. The middleware that uses them knows *nothing* about which one it's calling:
+
+```csharp
+// conceptually, in LoadBalancingMiddleware:
+ILoadBalancingPolicy policy = /* resolved by name from the cluster's config */;
+DestinationState? chosen = policy.PickDestination(context, cluster, availableDestinations);
+```
+
+The same shape appears all over YARP: `ISessionAffinityPolicy`, `IActiveHealthCheckPolicy`, `IPassiveHealthCheckPolicy`, `IAvailableDestinationsPolicy`, `IAffinityFailurePolicy`, `IDestinationResolver`. **Whenever you see `I...Policy`, you're looking at Strategy.**
+
+The `Name` property is a nice professional touch: it lets config select a strategy by string ("RoundRobin") while code stays type-safe, and it lets the container hold *all* implementations and pick the right one by name.
+
+> **Interview relevance:** "How would you let users choose between load-balancing algorithms?" → Strategy: one interface, many implementations, selected by name, resolved via DI. You can literally cite this code.
+
+---
+
+## 3. Factory — encapsulating *how to create* something
+
+**Problem it solves:** sometimes *creating* an object is itself a decision with logic, configuration, or polymorphism. A **Factory** centralizes that creation so callers don't hard-code `new`.
+
+YARP has several. The cleanest to study is `IRandomFactory`:
+
+```csharp
+public interface IRandomFactory
+{
+    Random CreateRandomInstance();
+}
+
+internal sealed class RandomFactory : IRandomFactory
+{
+    public Random CreateRandomInstance() => Random.Shared;
+}
+```
+
+Why wrap something as trivial as getting a `Random`? **Testability.** Production uses `RandomFactory` (real randomness); a test injects a fake factory returning a *deterministic* sequence, so a test of `PowerOfTwoChoices` can assert exactly which destination is chosen. The factory turns an uncontrollable dependency (randomness) into an injectable, controllable one (Part 04 expands this).
+
+A heavier factory is `IForwarderHttpClientFactory` / `ForwarderHttpClientFactory`, which builds the per-cluster `HttpClient` (with its connection pool, TLS, protocol settings) from a cluster's config. Creating a correct `HttpClient` is genuinely complex, so it's encapsulated behind a factory you can replace.
+
+> **Recognize it by:** `I...Factory` with a `Create...` method. Use it when object creation has logic worth isolating, or when you need to make creation swappable/testable.
+
+---
+
+## 4. Builder + Fluent Interface — readable, incremental configuration
+
+**Problem it solves:** configuring a complex subsystem with many optional parts is awkward with constructors. A **Builder** lets you assemble it step by step, and a **fluent interface** (methods returning the builder) makes it read like a sentence.
+
+`AddReverseProxy` returns a builder you chain onto:
+
+```csharp
+public static IReverseProxyBuilder AddReverseProxy(this IServiceCollection services)
+{
+    var builder = new ReverseProxyBuilder(services);
+    builder
+        .AddConfigBuilder()
+        .AddRuntimeStateManagers()
+        .AddConfigManager()
+        .AddSessionAffinityPolicies()
+        .AddActiveHealthChecks()
+        .AddPassiveHealthCheck()
+        .AddLoadBalancingPolicies()
+        .AddDestinationResolver()
+        .AddProxy();
+    ...
+    return builder;
+}
+```
+
+And the user continues the chain:
+
+```csharp
+services.AddReverseProxy()
+        .LoadFromConfig(configuration)
+        .AddTransforms(...);
+```
+
+Each method registers some services and **returns the builder** so the next call chains. The builder itself is minimal — it just holds the `IServiceCollection`:
+
+```csharp
+internal sealed class ReverseProxyBuilder : IReverseProxyBuilder
+{
+    public ReverseProxyBuilder(IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        Services = services;
+    }
+    public IServiceCollection Services { get; }
+}
+```
+
+The actual chainable methods are **extension methods** (`LoadFromConfig`, `AddConfigFilter<T>`, …) on `IReverseProxyBuilder`. This is a deliberate, very .NET pattern: a tiny core interface, extended by many discoverable extension methods, so the API can grow without changing the interface.
+
+> **Why it matters:** this fluent `Add...().Use...()` style *is* the ASP.NET Core configuration idiom. Recognizing "builder + extension methods + return-this fluency" means you can both read and design the configuration surface of any .NET library.
+
+---
+
+## 5. Extension Methods — adding capability without inheritance
+
+Worth calling out on its own because it's pervasive and C#-specific. An **extension method** is a static method that *appears* to be an instance method on a type you don't own:
+
+```csharp
+public static IReverseProxyBuilder LoadFromConfig(this IReverseProxyBuilder builder, IConfiguration config)
+{
+    ...
+    return builder;
+}
+```
+
+The `this IReverseProxyBuilder builder` first parameter is the magic: now anyone can write `builder.LoadFromConfig(config)`. The entire `AddReverseProxy().LoadFromConfig()...` fluent API, and indeed most of ASP.NET Core's `services.AddX()` / `app.UseX()` surface, is built from extension methods. They let a library expose a rich, discoverable API around a small set of core types, and let *you* add methods to types you can't modify.
+
+> **Recognize it by:** `public static ... this SomeType x ...`. Master this and the whole "`services.AddThis().AddThat()`" ecosystem stops being mysterious.
+
+---
+
+## 6. Middleware / Chain of Responsibility — the request pipeline
+
+**Problem it solves:** a request must pass through many independent processing steps (auth, routing, load balancing, forwarding), each able to act, modify, or stop the flow, in a configurable order. **Chain of Responsibility** links handlers so each decides whether to handle and/or pass along.
+
+ASP.NET Core's middleware (Components Part 02) is this pattern. Each YARP stage is a middleware — `LoadBalancingMiddleware`, `SessionAffinityMiddleware`, `PassiveHealthCheckMiddleware`, `ForwarderMiddleware` — and they're composed into a pipeline where each calls the "next." The order is configured once; each stage is independent and replaceable.
+
+> **Why it matters:** the pipeline/middleware model is the backbone of every ASP.NET Core app. Seeing it as Chain of Responsibility (with the option to *short-circuit*) lets you reason about ordering bugs ("why does auth need to run before forwarding?") structurally rather than by trial and error.
+
+---
+
+## 7. Null Object — a do-nothing implementation that removes special-casing
+
+**Problem it solves:** code depends on an interface that sometimes has no real implementation (e.g., a Windows-only feature on Linux). Sprinkling `if (delegator != null)` everywhere is ugly and error-prone. The **Null Object** pattern provides a *do-nothing* implementation so callers never need null checks.
+
+YARP's HTTP.sys delegation is Windows-only. On Linux it registers a dummy:
+
+```csharp
+internal sealed class DummyHttpSysDelegator : IHttpSysDelegator
+{
+    public void ResetQueue(string queueName, string urlPrefix) { }   // intentionally empty
+}
+```
+
+```csharp
+// in AddReverseProxy:
+if (OperatingSystem.IsWindows())
+    builder.AddHttpSysDelegation();                                   // real implementation
+else
+    builder.Services.TryAddSingleton<IHttpSysDelegator, DummyHttpSysDelegator>();  // no-op
+```
+
+Now any code that injects `IHttpSysDelegator` can call it unconditionally; on Linux it harmlessly does nothing. The platform difference is handled *once* at registration, not scattered through the codebase.
+
+> **Recognize it by:** an implementation whose methods are deliberately empty/no-op, registered to satisfy a dependency that isn't meaningful in some context. Cleaner than null checks; a favorite in cross-platform code.
+
+---
+
+## 8. Decorator — wrapping to add behavior without changing the original
+
+**Problem it solves:** you want to add behavior (measurement, logging) to an object without modifying it or its callers. A **Decorator** implements the same interface, wraps an instance, and adds behavior around the delegated calls.
+
+YARP's WebSocket telemetry (Components Part 02 §10) wraps the connection's stream to *count bytes* as they flow, without changing how the bytes are copied: `WebSocketsTelemetryStream` is a stream that delegates reads/writes to the inner stream while tallying throughput. The base `DelegatingStream` (in `Utilities/`) exists precisely to make such wrappers easy — it forwards every `Stream` member to an inner stream so a decorator only overrides the one or two it cares about.
+
+> **Why it matters:** decoration is how you add cross-cutting concerns (metrics, retries, caching) *non-invasively*. "Wrap, delegate, augment" is a reusable move you'll apply constantly.
+
+---
+
+## 9. Adapter — making one interface look like another
+
+**Problem it solves:** you have a component speaking interface A, but the surrounding system expects interface B. An **Adapter** translates between them.
+
+In the Kubernetes controller (Components Part 04), `HostedServiceAdapter` lets an object be registered as both a typed service *and* a hosted background service. The Kubernetes config provider is itself an adapter: it makes the controller's generated config *look like* a standard YARP `IProxyConfigProvider`, so the core proxy consumes Kubernetes the same way it consumes a JSON file. The converter layer (`YarpParser`) adapts Kubernetes `Ingress` objects to YARP's route/cluster model.
+
+> **Recognize it by:** a class whose job is purely "speak the language the other side expects." Adapters are the glue that lets independently-designed systems compose.
+
+---
+
+## 10. Double-Checked Locking — initialize-once, read-cheap (advanced)
+
+**Problem it solves:** lazily create an expensive shared thing exactly once, with many threads possibly racing to trigger it, *without* paying a lock on every subsequent read. This is an advanced concurrency pattern and YARP uses it correctly in `ProxyConfigManager`:
+
+```csharp
+public override IReadOnlyList<Endpoint> Endpoints
+{
+    get
+    {
+        if (_endpoints is null)            // 1st check: no lock, fast path
+        {
+            lock (_syncRoot)               // only race losers enter here
+            {
+                if (_endpoints is null)    // 2nd check: did someone else init while we waited?
+                {
+                    InitialLoad...();
+                }
+            }
+        }
+        return _endpoints;
+    }
+}
+```
+
+The first `if` (no lock) handles the overwhelmingly common case — already initialized — at zero synchronization cost. Only the rare first-time callers take the lock, and the *second* `if` inside the lock ensures the work happens once even if several threads got past the first check simultaneously. Getting this subtly wrong is a famous source of bugs (it requires the field's writes to be properly ordered, which `Volatile`/the swap logic ensures — see Part 03).
+
+> **Why it matters:** double-checked locking is a canonical interview/whiteboard topic. Seeing it *correctly* implemented in production — paired with the `Volatile.Write` swap in Part 03 — is the best way to actually understand it.
+
+---
+
+## 11. The Pattern Map (your cheat sheet)
+
+| Pattern | YARP example | The question it answers |
+| --- | --- | --- |
+| **Dependency Injection** | every ctor taking interfaces; `TryAddSingleton` | How do collaborators get supplied + swapped? |
+| **Strategy / Policy** | `ILoadBalancingPolicy` and the `*Policy` family | How do I make an algorithm interchangeable? |
+| **Factory** | `IRandomFactory`, `IForwarderHttpClientFactory` | How do I make *creation* swappable/testable? |
+| **Builder + Fluent** | `AddReverseProxy().LoadFromConfig()...` | How do I configure a complex thing readably? |
+| **Extension methods** | `LoadFromConfig(this IReverseProxyBuilder ...)` | How do I grow an API around small core types? |
+| **Middleware / Chain of Responsibility** | the request pipeline, `*Middleware` | How do steps process + pass + short-circuit? |
+| **Null Object** | `DummyHttpSysDelegator` | How do I avoid null-checks for absent features? |
+| **Decorator** | `WebSocketsTelemetryStream`, `DelegatingStream` | How do I add behavior without touching callers? |
+| **Adapter** | K8s `KubernetesConfigProvider`, `YarpParser` | How do I make A look like B? |
+| **Double-checked locking** | `ProxyConfigManager.Endpoints` | How do I init-once but read-cheap, thread-safely? |
+
+> **The meta-lesson:** notice how many entries are variations of "**program to an interface, supply the implementation later**." DI, Strategy, Factory, Null Object, Adapter, Decorator are all that idea in different costumes. When you design your own systems, reach for an interface at the seam where behavior might change — that single instinct, applied well, is most of what separates junior structure from senior structure.
+
+Next: **Part 03 — concurrency, async, and observability**: the immutable-snapshot config swap, lock-free reads, `CancellationToken`-as-change-signal, and the near-free `EventSource`/`LoggerMessage` instrumentation.
+# Code Evaluation — Part 03: Concurrency, Async & Observability
+
+> This is the most advanced — and most career-defining — material in the series. Your `persona.md` lists async internals, lock-free programming, race conditions, and synchronization as priority growth areas, and YARP is a master-class in exactly those. We'll study how YARP changes shared configuration *while serving traffic* without locks on the hot path, how it uses `async`/`await` and `CancellationToken` correctly, and how it instruments everything for near-zero cost. Real code throughout.
+>
+> Read Part 01 (`Interlocked`, `Volatile`, `ValueTask`) first — this builds directly on it.
+
+---
+
+## 1. The Core Problem: Mutable Shared State Under Massive Concurrency
+
+A reverse proxy has thousands of requests in flight, each *reading* configuration (routes, clusters, destinations, health). Meanwhile that configuration *changes* — a file is edited, Kubernetes pushes an update, a health probe flips a destination. Two threads, one writing and many reading the same data, is the textbook setup for **race conditions** and **torn reads** (seeing a half-updated state).
+
+The naive fix — a lock around all shared state — would make every request contend on one lock, destroying throughput. YARP's solution is the pattern you should tattoo on your brain as a systems engineer: **immutable snapshots swapped atomically, with locks only on the rare writer path.**
+
+---
+
+## 2. Immutable Snapshot + Atomic Swap (the heart of YARP)
+
+The discipline is documented in the code itself (`Model/README.md`): every runtime-state object must be **immutable**, or wrap an immutable value in an **atomic holder**, or be a **thread-safe atomic** counter. Nothing is mutated in place.
+
+Here is the actual swap, in `ProxyConfigManager` (lightly trimmed):
+
+```csharp
+private CancellationTokenSource _endpointsChangeSource = new();
+private IChangeToken _endpointsChangeToken;
+private List<Endpoint>? _endpoints;
+private readonly object _syncRoot = new();
+
+// READERS call this on every request — note: NO LOCK.
+public override IChangeToken GetChangeToken() => Volatile.Read(ref _endpointsChangeToken);
+
+// WRITER path — runs only when config changes.
+private void UpdateEndpoints(List<Endpoint> endpoints)
+{
+    lock (_syncRoot)                                  // serialize WRITERS only
+    {
+        var oldCancellationTokenSource = _endpointsChangeSource;
+
+        Volatile.Write(ref _endpoints, endpoints);    // publish the new immutable list atomically
+
+        _endpointsChangeSource = new CancellationTokenSource();
+        Volatile.Write(ref _endpointsChangeToken,
+                       new CancellationChangeToken(_endpointsChangeSource.Token));
+
+        oldCancellationTokenSource?.Cancel();         // signal "config changed" to subscribers
+    }
+}
+```
+
+Unpack the genius:
+
+- **Readers never lock.** They call `Volatile.Read(ref _endpoints)` (or read through the change token) and get *whatever the current published reference is*. A reader either sees the entirely-old list or the entirely-new list — never a mix — because reference assignment is atomic and `Volatile` enforces visibility/ordering.
+- **The writer builds a brand-new list** and **publishes it with a single `Volatile.Write`**. The old list is not touched; in-flight requests holding it keep working against a consistent snapshot until they finish. New requests pick up the new reference. This is **snapshot consistency** with zero reader coordination.
+- **The lock guards only writers** (`_syncRoot`) — and config changes are rare, so contention is essentially nil.
+- **`Volatile.Write`** is what makes the swap *safe*: it guarantees the new list is fully constructed and visible to other cores *before* the reference is seen pointing at it (preventing a reader from seeing the new reference but stale contents — the subtle bug that sinks naive double-checked locking).
+
+This is the production-correct version of the double-checked locking from Part 02 §10, and it's the same family of idea as **RCU (read-copy-update)** in the Linux kernel and **persistent data structures** in functional programming.
+
+> **This is your single highest-leverage takeaway.** "How do you mutate shared state read by thousands of concurrent requests without locking readers?" → immutable snapshot, build-new-then-atomic-swap-the-reference, `Volatile` for ordering, lock only writers. Being able to explain *and* defend this (why not a `lock`? why not `ConcurrentDictionary`? why `Volatile`?) is a senior-level concurrency conversation.
+
+---
+
+## 3. Change Notification via `CancellationToken` (a clever idiom)
+
+Look again at how the swap *signals* "config changed": it uses a `CancellationTokenSource` not to cancel work, but as a **one-shot broadcast signal**:
+
+```csharp
+_endpointsChangeSource = new CancellationTokenSource();
+_endpointsChangeToken  = new CancellationChangeToken(_endpointsChangeSource.Token);
+...
+oldCancellationTokenSource?.Cancel();   // fires the OLD token → "something changed, re-read"
+```
+
+The pattern: a `CancellationToken` is really just "a thing that fires once and lets listeners register callbacks." ASP.NET Core's routing subscribes to `GetChangeToken()`; when the old source is `Cancel()`led, routing re-reads the endpoints and rebuilds its match table. After signaling, a *fresh* token is installed for the next change.
+
+This is the same `IChangeToken` mechanism the file-config provider uses (Components Part 01). Repurposing `CancellationToken` as a general "change happened" notifier is an idiomatic .NET move worth recognizing — it's used all over the framework.
+
+> **Lesson:** `CancellationToken` is a general-purpose *signal*, not just a cancel button. Recognizing this unlocks a lot of framework code that uses change tokens for config reload, cache invalidation, and lifecycle events.
+
+---
+
+## 4. `async` / `await`: Cooperative Concurrency at Scale
+
+A proxy must handle tens of thousands of *simultaneous* connections, most of them just *waiting* on slow network I/O. Dedicating a thread to each would exhaust memory and the scheduler. `async`/`await` is the answer: a small thread pool services many connections by *suspending* a request when it's waiting on I/O and *resuming* it when data is ready.
+
+YARP is `async` end to end. The forwarder's signature:
+
+```csharp
+public async ValueTask<ForwarderError> SendAsync(
+    HttpContext context, string destinationPrefix,
+    HttpMessageInvoker httpClient, ForwarderRequestConfig requestConfig,
+    HttpTransformer transformer, CancellationToken cancellationToken)
+```
+
+**The mental model you must build (it's on your priority list):**
+
+- `await someIoTask;` does **not** block a thread. It *returns the thread to the pool* and registers a continuation. When the I/O completes, the runtime grabs *a* pool thread and resumes after the `await`. So one thread can advance hundreds of requests, each parked at its own `await`.
+- The compiler rewrites each `async` method into a **state machine** — an object that remembers "where was I" across each `await`. (This is why hot-path methods avoid capturing unnecessary variables: each captured variable enlarges that state-machine object. You can see YARP deliberately minimizing captures: *"Avoid capturing 'isRequest' and 'timeProvider' in the state machine when telemetry is disabled."*)
+- **`ValueTask`** (Part 01 §4) avoids allocating that state-machine/`Task` when the method completes synchronously — common when data is already buffered.
+
+> **Embedded parallel:** this is *cooperative multitasking* — exactly like a cooperative RTOS where tasks yield at await points — but the compiler generates the yield/resume bookkeeping for you. Your firmware intuition about "don't block; yield and come back" maps perfectly. The difference is the scheduler is the .NET thread pool, and the "yield points" are `await`s.
+
+---
+
+## 5. `CancellationToken` for Timeouts and Teardown
+
+Async work must be cancellable — a client disconnects, a timeout fires, the app shuts down. The proxy threads a `CancellationToken` through every async call so the whole forward can be torn down promptly. YARP wraps this in `ActivityCancellationTokenSource` (a pooled, reusable source tied to request timeouts), and the stream copier *resets* the timeout on every successful chunk:
+
+```csharp
+read = await input.ReadAsync(buffer.AsMemory(), cancellation);
+...
+activityToken.ResetTimeout();   // progress was made → push the idle deadline out
+```
+
+This implements the **idle/activity timeout** (the same 100s behavior behind open issue #1764): a request isn't killed for taking long *overall*, only for going *silent* — the correct way to reap dead connections without punishing slow-but-alive ones. And on cancellation, the error is classified precisely:
+
+```csharp
+if (activityToken.CancelledByLinkedToken)
+    return (StreamCopyResult.Canceled, ex);
+```
+
+> **Lesson:** professional async code is *cancellation-aware everywhere*. A `CancellationToken` parameter on every async method is not boilerplate — it's how the system stays responsive and leak-free under failure. Adopt the habit of accepting and honoring `CancellationToken` in your own async APIs.
+
+---
+
+## 6. Structured Error Handling: Classify, Don't Just Throw
+
+Notice YARP almost never lets a raw exception escape to mean "it failed." It **classifies** failures into a precise enum and returns/reports them. From the forwarder's failure handler:
+
+```csharp
+return await ReportErrorAsync(
+    requestBodyCanceled ? ForwarderError.RequestBodyCanceled : ForwarderError.RequestCanceled,
+    StatusCodes.Status502BadGateway);
+...
+return await ReportErrorAsync(ForwarderError.RequestTimedOut, StatusCodes.Status504GatewayTimeout);
+...
+return await ReportErrorAsync(
+    failedDuringRequestCreation ? ForwarderError.RequestCreation : ForwarderError.Request,
+    StatusCodes.Status502BadGateway);
+```
+
+And exceptions are caught *narrowly*, with **exception filters** (`when (...)`):
+
+```csharp
+catch (HttpRequestException hre) when (tryDowngradingH2WsOnFailure) { ... }
+```
+
+The `when (...)` filter means the `catch` only runs if the condition holds — otherwise the exception keeps propagating *without unwinding the stack into this handler*. This is more precise (and cheaper) than catching broadly and re-throwing.
+
+Two professional habits here:
+
+1. **Expected failures are return values, not exceptions.** `ForwarderError` + a `(result, exception)` tuple (Part 01 §8) communicates "what went wrong" structurally, so callers (logging, passive health, metrics) can react precisely — "connection refused" vs "client disconnected" lead to different health decisions. Throwing for *expected* conditions is slow and loses that structure.
+2. **Catch narrowly, filter precisely.** Broad `catch (Exception)` that swallows everything is a code smell; YARP catches specific types with filters and always *does something deliberate* (classify, report, sometimes retry like the HTTP/2 WebSocket downgrade).
+
+> **Interview relevance:** "When should you use exceptions vs return codes?" → exceptions for the genuinely exceptional/unrecoverable; structured return values for expected, recoverable outcomes on a hot path. YARP's `ForwarderError` is the canonical example.
+
+---
+
+## 7. Near-Free Observability: `EventSource`
+
+YARP instruments every forwarding stage, but it can't afford instrumentation that costs anything when no one's watching. The trick (Components Part 03) is `EventSource`, gated on subscription:
+
+```csharp
+// Only build the telemetry helper if someone is actually listening.
+var telemetry = ForwarderTelemetry.Log.IsEnabled(EventLevel.Informational, EventKeywords.All)
+    ? new StreamCopierTelemetry(isRequest, timeProvider)
+    : null;
+...
+telemetry?.AfterRead(contentLength);   // null-conditional: no-op when not listening
+ForwarderTelemetry.Log.ForwarderStage(ForwarderStage.SendAsyncStart);
+```
+
+When no listener is attached, `IsEnabled(...)` is false, the telemetry object is never allocated, and every `telemetry?.X()` is a cheap null check. Only when a consumer subscribes does the machinery spin up. This is how YARP can fire fine-grained events (per forwarding stage, per stream read/write) *in the hot path* without measurable cost in production.
+
+> **Lesson:** "instrument generously, pay only when observed" is the professional approach to telemetry. The `?.` null-conditional + an `IsEnabled` gate is the idiom. (Compare to naive logging that formats strings on every call regardless of log level — a real performance bug.)
+
+---
+
+## 8. Allocation-Free, Structured Logging: `LoggerMessage`
+
+Ordinary logging (`logger.LogWarning($"... {clusterId} ...")`) allocates a string and boxes arguments *every call*, even if the log level is disabled. YARP uses the **`LoggerMessage` pattern** to pre-compile log delegates once:
+
+```csharp
+internal static class Log
+{
+    private static readonly Action<ILogger, string, Exception?> _affinityCannotBeEstablished =
+        LoggerMessage.Define<string>(
+            LogLevel.Warning,
+            EventIds.AffinityCannotBeEstablishedBecauseNoDestinationsFoundOnCluster,
+            "The request affinity cannot be established because no destinations are found on cluster `{clusterId}`.");
+
+    public static void AffinityCannotBeEstablishedBecauseNoDestinationsFound(ILogger logger, string clusterId)
+        => _affinityCannotBeEstablished(logger, clusterId, null);
+}
+```
+
+`LoggerMessage.Define<string>(...)` builds a strongly-typed, cached delegate *once* (static readonly). Each log call invokes that delegate, which **skips all work if the level is disabled** and avoids re-parsing the message template and boxing. Every log site also carries a stable **`EventId`** (from a central `EventIds` class), so logs are filterable and correlatable by ID, not just by message text.
+
+Modern .NET takes this further with a **source generator** (`[LoggerMessage]` attribute) that writes this boilerplate for you at compile time — you'll see both styles in current code.
+
+> **Lesson:** in high-throughput services, logging is a performance surface. The `LoggerMessage` pattern (cached delegates, structured `EventId`s, no work when disabled) is the professional standard. Naive interpolated-string logging in a hot loop is a classic junior mistake.
+
+---
+
+## 9. The Concurrency/Async Cheat Sheet
+
+| Technique | YARP example | The principle |
+| --- | --- | --- |
+| Immutable snapshot + atomic swap | `ProxyConfigManager.UpdateEndpoints` | Mutate shared state without locking readers |
+| `Volatile.Read/Write` | the endpoint swap | Visibility + ordering across cores |
+| Lock the writer, never the reader | `_syncRoot` around updates only | Hot path stays contention-free |
+| `Interlocked` counters | `AtomicCounter` | Lock-free shared counters |
+| `CancellationToken` as change signal | `_endpointsChangeSource.Cancel()` | One-shot broadcast notification |
+| `async`/`await` + `ValueTask` | the whole forwarder | Cooperative concurrency, no thread-per-connection |
+| Cancellation everywhere | `ActivityCancellationTokenSource`, `ResetTimeout` | Responsive teardown, idle timeouts |
+| Classify failures, filter catches | `ForwarderError`, `catch ... when` | Structured, precise error handling |
+| Gated `EventSource` | `IsEnabled(...)` + `telemetry?.` | Free-when-unobserved telemetry |
+| `LoggerMessage` delegates + `EventId` | `SessionAffinity/Log.cs` | Allocation-free, structured logging |
+
+> **The synthesis for your career:** these are *precisely* the topics (lock-free programming, async internals, synchronization, race conditions) your persona flags as growth areas and that big-company systems interviews hammer. YARP gives you correct, production reference implementations of every one. Don't just read them — re-derive the config-swap from scratch and explain out loud why each `Volatile` is necessary. When you can do that, you've genuinely leveled up.
+
+Next: **Part 04 — testing, the seams that make it possible, and a concrete self-study plan** to convert all this reading into demonstrable mid-level ability.
+# Code Evaluation — Part 04: Testing, Seams & Your Study Plan
+
+> The final piece. First, how a professional project is *tested* — the design seams that make testing possible, which is itself a hallmark of senior design. Then a concrete, sequenced **study plan** that turns everything in this series from "I read it" into "I can do it," aimed squarely at walking into a mid-level role at a company like Microsoft and being up to speed.
+
+---
+
+## 1. Testability Is a Design Property, Not an Afterthought
+
+The single biggest difference between personal-project code and professional code is that professional code is **designed to be tested**. You can't bolt good tests onto tangled code; you build the seams in from the start. YARP is full of these seams, and recognizing them teaches you to write testable code yourself.
+
+### Seam 1 — Inject your dependencies (so tests can substitute fakes)
+
+Every class takes its collaborators as constructor parameters typed as *interfaces* (Part 02 §1). That means a test can pass *fake* collaborators. The load-balancing policy takes `IRandomFactory` rather than calling `Random.Shared` directly — so a test can make randomness deterministic:
+
+```csharp
+public PowerOfTwoChoicesLoadBalancingPolicy(IRandomFactory randomFactory) { ... }
+```
+
+In production, `RandomFactory` returns `Random.Shared`. In a test, you inject a fake `IRandomFactory` whose `Random` returns a *scripted* sequence, so "pick two at random, choose the less busy" becomes **deterministically assertable**. Without that seam, the policy would be untestable (you can't assert on true randomness).
+
+### Seam 2 — Abstract the uncontrollable: time
+
+Tests must not depend on wall-clock time (slow, flaky). YARP abstracts time behind `IClock`/`TimeProvider`:
+
+```csharp
+[Obsolete("For testing only. Use TimeProvider instead.")]
+public interface IClock
+{
+    DateTimeOffset GetUtcNow();
+    long TickCount { get; }
+    Task Delay(TimeSpan delay, CancellationToken cancellationToken);   // testable "wait"
+}
+```
+
+The comment *"facilitates unit tests that use virtual time"* says it outright. A health-check test that needs "advance 30 seconds" uses a fake/virtual time provider and advances it **instantly** — no real waiting, no flakiness. (Note the professional touch: `IClock` is marked `[Obsolete]` pointing at the framework's newer `TimeProvider`, showing how a mature project *migrates* abstractions over time while keeping the old one working.)
+
+> **The principle:** anything nondeterministic or slow — randomness, time, the network, the filesystem — must sit behind an interface so tests can replace it. Spotting "what's uncontrollable here?" and putting a seam there is a senior design skill.
+
+### Seam 3 — `InternalsVisibleTo` to test internals without exposing them
+
+From the csproj (Part 00 §3):
+
+```xml
+<InternalsVisibleTo Include="Yarp.ReverseProxy.Tests" />
+<InternalsVisibleTo Include="DynamicProxyGenAssembly2" Key="$(MoqPublicKey)" />
+```
+
+This lets the test assembly (and the Moq mocking engine) see `internal` types. So YARP keeps its implementations `internal sealed` (minimal public surface, Part 00 §4) *and* still unit-tests them directly. You don't have to choose between "testable" and "encapsulated."
+
+---
+
+## 2. The Test Pyramid in Practice
+
+YARP's test projects (Components Part 05 §4) implement the classic **test pyramid**:
+
+```
+            ╱╲          few, slow, high-confidence
+           ╱  ╲         ReverseProxy.FunctionalTests  — real proxy + real backends, real HTTP
+          ╱────╲        Kubernetes.Tests / Application.Tests — subsystem integration
+         ╱──────╲       ReverseProxy.Tests — many, fast unit tests (one component, faked deps)
+        ╱────────╲      testassets/BenchmarkApp — performance is tested too
+```
+
+| Layer | What it verifies | Trade-off |
+| --- | --- | --- |
+| **Unit** (`ReverseProxy.Tests`) | One class in isolation with faked deps (the seams above) | Fast + pinpoints the break; can't catch integration bugs |
+| **Functional** (`ReverseProxy.FunctionalTests`) | A real proxy forwarding to real in-process backends over real HTTP | High confidence; slower + harder to localize failures |
+| **Benchmarks** (`testassets/BenchmarkApp`) | Throughput/latency/allocations don't regress | Performance treated as a tested property |
+
+The functional tests are why `testassets/` exists: `TestServer` (a configurable backend) and `TestClient` give the proxy something real to proxy. **The lesson:** unit tests prove components are *correct*; functional tests prove they're correct *together*; benchmarks prove they're *fast*. A serious product needs all three, and the architecture's interface seams serve double duty — they enable customization *and* unit testing.
+
+> **Interview relevance:** "How do you test a high-throughput networked component?" → pyramid: many fast unit tests over faked seams (time, randomness, network), fewer functional tests with real servers, plus benchmarks guarding performance. Cite YARP's structure.
+
+---
+
+## 3. What "Reading a Big Codebase" Should Look Like (your stated weakness)
+
+Your persona flags navigating large enterprise repos as a growth area. Here's the senior approach, demonstrated on YARP, that you can apply to *any* unfamiliar codebase:
+
+1. **Find the architecture seams first, not the code.** Identify the projects and their dependencies (Components Part 00). Don't read top-to-bottom; build the map.
+2. **Trace one request end-to-end.** Pick the primary control flow (here: a request through the pipeline) and follow it across components. One real trace teaches more than reading ten files in isolation.
+3. **Learn the naming conventions and let them guide you.** Once you know `I*Policy` = Strategy, `*Middleware` = pipeline stage, `*Config`/`*State` = immutable data (Components Part 00 §4), you can predict what a file does from its name. Conventions are a map.
+4. **Read the tests to learn intended behavior.** A class's unit test is executable documentation of how it's *meant* to be used and what edge cases matter.
+5. **Read the `docs/designs/` and `README`s.** Maintainers explain the *why* there (e.g., `Model/README.md`'s immutability rule). The why is the hardest thing to reverse-engineer from code alone.
+6. **Use the debugger as a microscope.** Set a breakpoint in `HttpForwarder.SendAsync`, send one request, and step. Watching real values flow makes the abstractions concrete.
+
+> This *is* the onboarding playbook at big companies. Nobody reads the whole repo; they map it, trace it, and learn the conventions. Practicing this deliberately on YARP is rehearsal for your first week on the job.
+
+---
+
+## 4. Your Sequenced Study Plan
+
+A path from "read these docs" to "demonstrably mid-level." Each phase has a concrete, *buildable* deliverable, because skill comes from producing, not reading.
+
+### Phase 1 — Foundations you can prove (1–2 weeks)
+- **Turn on `<Nullable>enable</Nullable>`** in one of your existing projects and fix every warning. Feel where null-safety changes your designs.
+- **Re-implement, from memory:** `AtomicCounter`, `ValueStopwatch`, and a minimal `ILoadBalancingPolicy` with `RoundRobin` + `PowerOfTwoChoices`. These are small and touch DI, `struct`s, `Interlocked`, and Strategy at once.
+- **Deliverable:** a tiny console app that registers two policies via DI, picks destinations, and has a unit test that injects a *fake* `IRandomFactory` to make `PowerOfTwoChoices` deterministic. *Now you've done the seam-for-testability move yourself.*
+
+### Phase 2 — Async & performance (2–3 weeks)
+- **Write a streaming copier**: `ValueTask<long> CopyAsync(Stream in, Stream out, CancellationToken)` using `ArrayPool<byte>` + `Memory<byte>`, with correct rent/return and cancellation. Compare against a naive `byte[]`-per-call version.
+- **Add [BenchmarkDotNet]** and measure allocations both ways. *Seeing* the GC drop is the lesson.
+- **Deliverable:** a short write-up (for yourself) explaining, in your words, why `Memory` not `Span` across `await`, why `ValueTask`, and why pooling — as if answering an interviewer.
+
+### Phase 3 — Concurrency (2–3 weeks, the big one)
+- **Implement a `ConfigSnapshot` holder** with an immutable record swapped via `Volatile.Write` under a writer-only lock, read lock-free by many tasks. Hammer it with concurrent readers + a writer and assert no torn reads.
+- **Write up** why this beats a `lock`, why `Volatile`, and what RCU is. This is your headline concurrency story for interviews.
+- **Deliverable:** the holder + a stress test + the written explanation.
+
+### Phase 4 — Build a real (small) thing (3–4 weeks)
+- **Build a mini reverse proxy** on ASP.NET Core: config-driven routes → clusters → destinations, one load-balancing policy, basic health checking, and `IHttpForwarder` (or hand-rolled forwarding). Add structured logging via `LoggerMessage` and one `EventSource`.
+- **Deliverable:** a working proxy with unit + one functional test (a real in-process backend). This single project exercises *every* document in this series and is a portfolio piece you can discuss in depth.
+
+### Phase 5 — Contribute (ongoing)
+- **Ship the `help wanted` issues** from the `concepts/YarpOpenIssues/` series — start with **#1764** (docs) and **#275** (test cleanup), then **#2667** (telemetry) or **#2838** (a real bug). A merged PR into a Microsoft repo is concrete, verifiable evidence of mid-level capability — exactly what hiring managers want.
+
+---
+
+## 5. The Habits That Mark a Mid-Level Engineer (carry these forward)
+
+Distilled from everything YARP demonstrates:
+
+1. **Program to interfaces at every seam where behavior might change.** (DI, Strategy, Factory.) This one instinct produces most of "good architecture."
+2. **Default to `internal sealed`; treat `public` as a permanent promise.** Minimize surface area.
+3. **On the hot path, hunt allocations and copies.** Pool buffers, use `Span`/`Memory`/`ValueTask`, make small helpers `struct`s.
+4. **Never lock readers if you can swap an immutable snapshot instead.** Lock writers only.
+5. **Make the uncontrollable injectable** — time, randomness, network — so it's testable.
+6. **Classify failures structurally**; reserve exceptions for the truly exceptional.
+7. **Instrument generously but pay only when observed** (`EventSource` gating, `LoggerMessage`).
+8. **Honor `CancellationToken` everywhere** in async code.
+9. **Let conventions and tests document intent**; write yours so the next person benefits.
+10. **Build the test seams in from the start** — testability is a design decision, not a phase.
+
+> **Final word.** You came in with a real advantage: embedded engineers already think in buffers, ownership, stack vs heap, atomics, and cooperative scheduling — the exact instincts that YARP's hardest code rewards. What you were missing was the *idiomatic .NET expression* of those instincts and the *professional scaffolding* (DI, testing seams, immutable-snapshot concurrency, enforced conventions) that big-company code is built on. This series mapped all of it onto real, production Microsoft code. Now do the Phase 1–5 deliverables: reading made it familiar; *building* will make it yours. When you can re-derive the config-swap and explain every `Volatile`, defend `internal sealed`, and ship a merged YARP PR, you are not "preparing to be" mid-level — you are operating at that level. Go build.

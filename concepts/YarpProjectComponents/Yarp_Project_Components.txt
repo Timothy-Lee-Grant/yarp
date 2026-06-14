@@ -1,0 +1,1344 @@
+# YARP Project Components — Part 00: Architecture Overview
+
+> **Who this is written for.** You, Timothy — an embedded/firmware engineer (C/C++/Python/C#) moving deliberately toward backend, distributed systems, and cloud infrastructure. You read code well but want the *map before the streets*: overall architecture → major components → interactions → control flow, the way a senior engineer onboards a new teammate. This series is exactly that. We will not dwell on individual lines of code; we will explain **what every component and subcomponent is, why it exists, what problem it solves, and how the pieces talk to each other.**
+>
+> **Prerequisite.** The three files in `concepts/` (`01_FOUNDATIONS`, `02_TRAFFIC_MANAGEMENT`, `03_PERFORMANCE_AND_OPERATIONS`) taught the *concepts* (reverse proxy, L7, load balancing theory, immutable-snapshot concurrency, etc.). This new series (`YarpProjectComponents/`) maps those concepts onto the **actual code organization**. Where a concept was already taught, this series points back to it instead of re-teaching it.
+
+---
+
+## 1. The One-Paragraph Mental Model
+
+YARP is shipped as a **library** (plus a ready-to-run app and a few satellite projects). You add it to an ASP.NET Core application, and it turns that application into a reverse proxy. Internally it has two halves that you should learn to see separately: a **control plane** that ingests configuration (routes, clusters, destinations) from some source, validates it, and turns it into an immutable in-memory model; and a **data plane** — a pipeline of middleware — that uses that model to route, balance, health-check, transform, and forward each live request. Around that core sit three companion projects: a **telemetry consumption** library for observability, a **Kubernetes controller** that generates config from a cluster's state, and a **sample/host application**. That is the entire repository in one breath. The rest of this series zooms into each piece.
+
+---
+
+## 2. The Four Source Projects (and how they relate)
+
+Everything in `src/` is one of four .NET projects. This is the highest-level decomposition, and internalizing it makes the whole repo legible.
+
+| Project (folder) | NuGet/assembly identity | Role in one line | Depends on |
+| --- | --- | --- | --- |
+| **`src/ReverseProxy`** | `Yarp.ReverseProxy` | **The product.** The actual reverse proxy library: config model, runtime model, and the request pipeline. | ASP.NET Core platform |
+| **`src/TelemetryConsumption`** | `Yarp.Telemetry.Consumption` | **Observability add-on.** Subscribes to low-level .NET + YARP event streams and turns them into metrics/callbacks. | ReverseProxy (loosely), .NET diagnostics |
+| **`src/Kubernetes.Controller`** | `Yarp.Kubernetes.Controller` | **A config *source*.** Watches Kubernetes and generates YARP config from Ingress resources. | ReverseProxy, Kubernetes client |
+| **`src/Application`** | `Yarp.Application` | **A ready-to-run host.** A pre-built proxy app/template wiring the library together with sensible defaults. | ReverseProxy (+ others) |
+
+The dependency direction is the key insight: **`ReverseProxy` is the hub, and the other three are spokes.** TelemetryConsumption observes it, Kubernetes.Controller feeds it config, and Application hosts it. None of the spokes depend on each other. If you ever feel lost, return to this picture.
+
+```
+                 ┌───────────────────────────┐
+                 │   Yarp.ReverseProxy        │   ◀── THE CORE LIBRARY
+                 │   (control + data plane)   │       (the "product")
+                 └───────────────────────────┘
+                    ▲          ▲          ▲
+        observes it │  feeds   │  hosts   │
+                    │  config  │  it      │
+   ┌────────────────┴──┐  ┌────┴───────┐  ┌┴───────────────────┐
+   │ Telemetry.        │  │ Kubernetes │  │ Yarp.Application   │
+   │ Consumption       │  │ .Controller│  │ (host / template)  │
+   └───────────────────┘  └────────────┘  └────────────────────┘
+```
+
+---
+
+## 3. Control Plane vs. Data Plane — the most useful lens
+
+This distinction comes from networking and is *the* organizing idea for reading YARP's core. Learn it once and the folder list inside `src/ReverseProxy` stops looking like a random pile.
+
+**The control plane** decides *what the configuration is*. It answers: which routes exist? which clusters? which destinations? what policies apply? It runs occasionally — whenever configuration changes — and it is allowed to be relatively slow and careful, because correctness matters more than nanoseconds here. Its output is an **immutable model** of the proxy's intended behavior.
+
+**The data plane** *executes* that configuration on every single request. It answers: for *this* request, which route, which destination, which transforms, then forward the bytes. It runs millions of times and must be brutally fast and allocation-light. It only *reads* the model the control plane produced — it never blocks waiting for the control plane to finish an update (that's the immutable-snapshot trick from the Foundations series, Part 3 §3).
+
+```
+            CONFIG SOURCE (file / code / K8s)
+                       │
+   ┌───────────────────▼────────────────────┐
+   │              CONTROL PLANE              │   runs on change; careful & validating
+   │  Configuration → Validation → Model     │
+   │            (ProxyConfigManager)         │
+   └───────────────────┬────────────────────┘
+                       │ produces immutable snapshot, swapped atomically
+   ┌───────────────────▼────────────────────┐
+   │               DATA PLANE                │   runs per request; fast & lock-free
+   │  Route ▶ Affinity ▶ LoadBalance ▶       │
+   │  Health ▶ Transform ▶ Forward           │
+   └─────────────────────────────────────────┘
+```
+
+In this series, **Part 01 covers the control plane** (`Configuration`, `Model`, `Management`) and **Part 02 covers the data plane** (`Routing`, `LoadBalancing`, `Health`, `SessionAffinity`, `ServiceDiscovery`, `Forwarder`, `Transforms`, `Limits`, `Delegation`, `WebSocketsTelemetry`, `Utilities`).
+
+---
+
+## 4. Inside `Yarp.ReverseProxy`: the subcomponent map
+
+The core library has ~15 subfolders. Here is the full inventory, each tagged by plane and mapped to the document that covers it in depth. Skim this table now; it is the table of contents for Parts 01–02.
+
+| Subfolder | Plane | What it is | Covered in |
+| --- | --- | --- | --- |
+| `Configuration/` | Control | The *declarative shape* of config (RouteConfig, ClusterConfig, DestinationConfig) + provider/validator/filter interfaces | Part 01 |
+| `Configuration/ConfigProvider/` | Control | The built-in file/`IConfiguration`-based config source + snapshots | Part 01 |
+| `Configuration/RouteValidators/` | Control | Pluggable checks that a route is well-formed before adoption | Part 01 |
+| `Configuration/ClusterValidators/` | Control | Pluggable checks that a cluster is well-formed before adoption | Part 01 |
+| `Model/` | Control→Data bridge | The *runtime* model: immutable RouteState/ClusterState/DestinationState + atomic holders | Part 01 |
+| `Management/` | Control | **The orchestrator** (`ProxyConfigManager`) that ties source→validate→model→endpoints together | Part 01 |
+| `Routing/` | Data | Custom matcher policies (header, query) + endpoint construction | Part 02 |
+| `LoadBalancing/` | Data | The load-balancing policies + the middleware that applies one | Part 02 |
+| `Health/` | Data | Active + passive health checking, availability policies | Part 02 |
+| `SessionAffinity/` | Data | Sticky-session policies, affinity failure handling | Part 02 |
+| `ServiceDiscovery/` | Data | Destination resolution (e.g., DNS) into concrete addresses | Part 02 |
+| `Forwarder/` | Data | **The hot core**: the actual HTTP forwarding, stream copying, HTTP client factory | Part 02 |
+| `Transforms/` | Data | Request/response rewriting; `Transforms/Builder/` assembles them | Part 02 |
+| `Limits/` | Data | Request-level limits middleware (concurrency/size) | Part 02 |
+| `Delegation/` | Data | Windows HTTP.sys kernel-level request hand-off | Part 02 |
+| `WebSocketsTelemetry/` | Data | Instrumentation specifically for upgraded WebSocket connections | Part 02 |
+| `Utilities/` | Cross-cutting | Low-level helpers: atomic counters, clocks, value types, TLS frame parsing | Part 02 |
+
+A few orientation notes you'll appreciate as an embedded engineer used to reading unfamiliar trees:
+
+- The **`I`-prefixed interfaces** scattered everywhere (`IProxyConfigProvider`, `ILoadBalancingPolicy`, `IDestinationResolver`, …) are the **extensibility seams**. In .NET, `I` means "interface." YARP's whole "customize anything" philosophy is implemented as: define behavior behind an interface, register a default in the DI container, let you replace it. When you see an `I...`, read it as "a place I'm allowed to plug in my own implementation."
+- Files named **`*Middleware.cs`** are data-plane pipeline stages. Files named **`*Policy.cs`** are swappable strategies. Files named **`*Extensions.cs`** are the *registration* API (the `AddX()` / `UseX()` methods you call at startup). Files named **`*Config.cs`** are control-plane declarative data; **`*State.cs` / `*Model.cs`** are runtime data.
+
+---
+
+## 5. The companion projects at a glance
+
+We give each its own document, but here is the elevator pitch for each so the overview is complete.
+
+**`Yarp.Telemetry.Consumption` (Part 03).** YARP and the .NET runtime emit a firehose of structured diagnostic events via `EventSource` (sockets opened, DNS resolved, TLS handshakes, request stages, WebSocket lifecycle). This project is a *consumer* of that firehose: it provides `EventListenerService`s that subscribe to each event source and surface the data either as **metrics** (periodic aggregate numbers) or via **consumer interfaces** you implement to receive per-event callbacks. Its subfolders mirror the *areas* of telemetry: `Forwarder/`, `Http/`, `Kestrel/`, `NameResolution/` (DNS), `NetSecurity/` (TLS), `Sockets/`, `WebSockets/`. It is optional — pure observability — but it is the canonical example of the **"instrument with near-zero-cost events, subscribe out of band"** pattern that the Foundations series Part 3 §5 described.
+
+**`Yarp.Kubernetes.Controller` (Part 04).** This is the most intricate companion, and the one whose subfolders mystified you. It is a **Kubernetes controller**: a background process that watches the Kubernetes API for `Ingress` (and related) resources and continuously translates the cluster's desired routing into YARP config. Its subfolders are the standard anatomy of *any* serious controller — `Client/` (the watch/informer machinery), `Caching/` (a local mirror of watched objects), `Queues/` + `Rate/` (rate-limited work queues), `Services/` (the reconcile loop), `Converters/` (Ingress→YARP translation), `Protocol/` + `Dispatcher` (pushing generated config to proxy instances), `ConfigProvider/` (the seam into ReverseProxy's control plane), `Certificates/` (TLS for the controller's own endpoints), and `Hosting/` (running it all as background services). Part 04 explains each as an instance of the controller/reconciler pattern — directly relevant to your Kubernetes and distributed-systems goals.
+
+**`Yarp.Application` (Part 05).** A pre-assembled proxy application/host that wires the library together with config binding and a few extra features (static files, fallback, logging). Think of it as "YARP with the batteries included," useful as a template and as the thing packaged for container images. Part 05 also covers the **supporting cast** that isn't a runtime component but is essential to understanding a real enterprise repo: `src/Common/`, the `samples/` (each demonstrates one feature), the `test/` and `testassets/` projects (unit vs. functional tests, and the mock servers they need), and the `eng/` + build scripts + Azure pipelines (the CI/CD machinery — on your learning list).
+
+---
+
+## 6. The repository top level (so nothing looks mysterious)
+
+Beyond `src/`, the root has the scaffolding of a large, professionally maintained .NET open-source project. You do not need to master these, but knowing what each *is* removes the "what is all this?" friction.
+
+| Top-level folder/file | What it is | Why it's there |
+| --- | --- | --- |
+| `src/` | The four shipping projects | The actual product |
+| `test/` | Unit + functional test projects | Correctness; mirrors `src/` |
+| `testassets/` | Helper apps used *by* tests (mock backends, clients) | Tests need real servers to proxy to |
+| `samples/` | Small runnable demos, one feature each | Documentation-by-example |
+| `docs/` | Design docs (tunneling, config), operations runbooks | Design rationale & maintainer ops |
+| `eng/` | Build engineering: versions, signing, the Arcade SDK `common/` scripts | Reproducible enterprise builds |
+| `azure-pipelines*.yml`, `*.ps1`, `*.sh` | CI/CD pipeline + bootstrap scripts | Automated build/test/release |
+| `*.props`, `*.targets`, `global.json`, `NuGet.config` | MSBuild + SDK + package configuration | How .NET builds the solution |
+| `YARP.slnx` | The solution file listing all projects | The "table of contents" for the IDE |
+
+The recurring `Directory.Build.props` / `Directory.Build.targets` files are a .NET convention: settings that **automatically apply to every project in that folder and below**, so common configuration (language version, analyzers, signing) is written once. This is the .NET equivalent of a shared CMake include in your embedded world.
+
+---
+
+## 7. End-to-end control flow (the 60-second tour)
+
+To anchor everything, here is the life of the system from startup to serving a request, naming the components you'll meet:
+
+1. **Startup / registration.** The host app calls `AddReverseProxy()` (from `Management/ReverseProxyServiceCollectionExtensions`) to register all services in the DI container, then `LoadFromConfig(...)` (or supplies a custom `IProxyConfigProvider`) to choose a config source, then `MapReverseProxy()` to place the proxy's middleware pipeline and endpoints into the ASP.NET Core request pipeline.
+
+2. **Config load (control plane).** The `ProxyConfigManager` (`Management/`) pulls the current config from the provider(s), runs it through the **validators** (`Configuration/RouteValidators`, `ClusterValidators`) and any **config filters**, and builds the immutable **runtime model** (`Model/`). It registers each route as an ASP.NET Core **endpoint** (using `Routing/`).
+
+3. **Config changes (control plane).** When the source signals a change (file edited, K8s controller pushes new config, code mutates in-memory config), the manager rebuilds the model and **atomically swaps** it. In-flight requests keep using their snapshot; new requests pick up the new one. No locks on the request path.
+
+4. **Request arrives (data plane).** Kestrel parses it. Endpoint **routing** matches it to a route/cluster. Then the middleware chain runs: **session affinity** → **load balancing** (over **health**-filtered, **service-discovery**-resolved destinations) → **transforms** → **forwarder**. The forwarder streams the request to the chosen destination via a pooled HTTP client and streams the response back, applying response transforms.
+
+5. **Observation (cross-cutting).** Throughout, `EventSource`s fire; if `Yarp.Telemetry.Consumption` is wired up, those become metrics and callbacks. Failures get classified and feed passive health.
+
+Every noun in that tour is a folder in `src/`. The rest of this series is just zooming into each one.
+
+---
+
+## 8. How to read the rest of this series
+
+| Document | Covers | Why read it in this order |
+| --- | --- | --- |
+| **00 (this file)** | The map: 4 projects, 2 planes, the subcomponent inventory | Orientation first |
+| **01 — Control Plane** | `Configuration`, `Model`, `Management` | You must understand the model before the pipeline that reads it |
+| **02 — Data Plane** | `Routing` → `Forwarder`, `Transforms`, `Limits`, `Delegation`, `WebSocketsTelemetry`, `Utilities` | The request lifecycle, component by component |
+| **03 — TelemetryConsumption** | The observability project and its 7 area subfolders | Cross-cutting; safe to read anytime after 02 |
+| **04 — Kubernetes.Controller** | The controller and all its subfolders | A self-contained distributed-systems case study |
+| **05 — Application & Infra** | `Application`, `Common`, `samples`, `test`, `eng` | The "everything else," ties the repo together |
+
+By the end you will be able to point at any folder in `src/` and say what it does, why it exists, which plane it belongs to, and what it talks to. That is precisely the senior-engineer onboarding fluency your persona is aiming for.
+
+> **Interview relevance (a recurring section in this series).** "Walk me through the architecture of a reverse proxy / API gateway" is a staple system-design question. The control-plane/data-plane split, the immutable-snapshot config model, and the controller/reconciler pattern in Part 04 are all directly reusable talking points. We'll flag these as we go.
+# YARP Project Components — Part 01: The Control Plane (`Configuration`, `Model`, `Management`)
+
+> The control plane is the half of `Yarp.ReverseProxy` that decides **what the configuration is**. It ingests config from a source, validates it, and turns it into an immutable in-memory model that the data plane (Part 02) reads on every request. This document walks the three subcomponents that make up the control plane — `Configuration/`, `Model/`, and `Management/` — explaining what each is, why it exists, and how they hand off to each other.
+>
+> Keep the **control plane vs. data plane** lens from Part 00 in mind: everything here runs *occasionally* (on config change), is allowed to be careful and validating, and never sits on the per-request hot path.
+
+---
+
+## 1. The Big Picture: Three Layers of "Configuration"
+
+The single most important thing to understand before reading any file is that YARP has **three distinct representations of configuration**, and they are deliberately separate. Conflating them is the #1 source of confusion when reading the code.
+
+```
+   ┌──────────────────────────────────────────────────────────────┐
+   │  1. RAW SOURCE        e.g. appsettings.json, code, K8s CRDs    │
+   │     "text / external format"                                   │
+   └───────────────────────────┬──────────────────────────────────┘
+                               │  read by an IProxyConfigProvider
+                               ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │  2. DECLARATIVE CONFIG (Configuration/)                        │
+   │     RouteConfig, ClusterConfig, DestinationConfig — immutable  │
+   │     "what the user *asked for*", validated, source-agnostic    │
+   └───────────────────────────┬──────────────────────────────────┘
+                               │  compiled by ProxyConfigManager (Management/)
+                               ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │  3. RUNTIME MODEL (Model/)                                     │
+   │     RouteState, ClusterState, DestinationState + AtomicHolders │
+   │     "what the proxy is *doing right now*", incl. live health   │
+   └──────────────────────────────────────────────────────────────┘
+```
+
+**Why three layers and not one?** Each layer has a different *rate of change* and a different *audience*, which is a classic separation-of-concerns argument:
+
+- **Layer 1 (raw)** changes format-by-format. Keeping it isolated means the rest of YARP doesn't care whether config came from JSON, a database, or Kubernetes.
+- **Layer 2 (declarative `*Config`)** is the *contract*. It is what a user writes and what gets validated. It only changes when the user changes config. It is immutable and comparable so YARP can diff old vs. new and react minimally.
+- **Layer 3 (runtime `*State`/`*Model`)** carries things the user never wrote: live destination health, the currently-resolved destination list, dynamic state. It changes in reaction to *runtime events*, not just config edits.
+
+This mirrors exactly the naming convention documented in `Model/README.md`: `*Config` = "the portion that changes only on config reload," `*DynamicState` = "the portion that changes in reaction to runtime state." Hold this three-layer picture; everything below slots into it.
+
+---
+
+## 2. `Configuration/` — The Declarative Contract (Layer 2)
+
+### What problem it solves
+
+A reverse proxy needs a **precise, source-independent description** of routes, clusters, destinations, and all their options — one that can be validated, compared, and built from any source. `Configuration/` is that description plus the *interfaces* that define how config enters and is checked.
+
+### The data types (the "nouns")
+
+These are immutable record-like types. They are the Route/Cluster/Destination abstractions from the Foundations series made concrete.
+
+| Type (`Configuration/*.cs`) | Represents | Notable contents |
+| --- | --- | --- |
+| `RouteConfig` | One route | route id, the `RouteMatch`, cluster id, order, metadata, transforms, authorization/CORS/rate-limit/timeout policy names |
+| `RouteMatch` | The match criteria of a route | path pattern, hosts, methods, `RouteHeader[]`, `RouteQueryParameter[]` |
+| `RouteHeader` / `RouteQueryParameter` | A single header/query match rule | name, values, and a **match mode** |
+| `HeaderMatchMode` / `QueryParameterMatchMode` | *How* to match | exact, prefix, presence, contains, etc. (enums) |
+| `ClusterConfig` | One cluster | cluster id, dictionary of `DestinationConfig`, load-balancing policy name, health-check config, session-affinity config, HTTP client config |
+| `DestinationConfig` | One backend address | the address URL, optional health endpoint, host, metadata |
+| `HealthCheckConfig` → `ActiveHealthCheckConfig` / `PassiveHealthCheckConfig` | Health policy settings for a cluster | intervals, thresholds, policy names |
+| `SessionAffinityConfig` / `SessionAffinityCookieConfig` | Sticky-session settings | mode, policy, cookie attributes |
+| `HttpClientConfig` / `WebProxyConfig` | How the cluster's outbound HTTP client behaves | allowed HTTP versions, TLS options, proxy settings |
+
+**Why immutable?** Because the data plane reads these without locks. An immutable object can be shared across thousands of concurrent requests safely — no reader can ever see it half-updated. This is the foundation of the lock-free design (Foundations Part 3 §3). Note also the `*Constants.cs` files (`AuthorizationConstants`, `CorsConstants`, `RateLimitingConstants`, `TimeoutPolicyConstants`) — these hold the well-known string keys used to reference ASP.NET Core policies by name, the integration seam described in the Foundations Traffic-Management doc §7.
+
+### The interfaces (the "verbs" / seams)
+
+This is where YARP's extensibility lives. Each is a place you can plug in your own code.
+
+| Interface | Responsibility | When you'd implement it |
+| --- | --- | --- |
+| `IProxyConfigProvider` | **The config source.** Returns the current `IProxyConfig` and a *change token* to signal updates. | To load config from a custom source (DB, registry, your control plane) |
+| `IProxyConfig` | A single immutable snapshot: the list of routes + clusters + a change token | Returned by a provider; rarely implemented directly |
+| `IProxyConfigFilter` | A hook to **programmatically transform** config as it loads (inject defaults, rewrite values) | To mutate config in-flight before adoption |
+| `IConfigValidator` | The top-level validation entry point | Usually use the default |
+| `IConfigChangeListener` | Be notified when config is loaded/applied/fails | To react to reloads (logging, cache invalidation) |
+| `IYarpRateLimiterPolicyProvider` / `IYarpOutputCachePolicyProvider` | Bridges to ASP.NET Core's rate-limiter / output-cache policy lookups | Advanced policy integration |
+
+The two **built-in providers** live right here too:
+
+- `InMemoryConfigProvider` (+ its extensions) — you hold the config in memory and push updates from code. This is the provider you use when *your own system* (or the Kubernetes controller, Part 04) manages topology programmatically. It exposes an `Update(...)` method that swaps the config and fires the change token.
+- The file-based provider lives in the `ConfigProvider/` subfolder (next section).
+
+### `ConfigProvider/` — the built-in declarative source
+
+| File | Role |
+| --- | --- |
+| `ConfigurationConfigProvider` | An `IProxyConfigProvider` that reads routes/clusters from an ASP.NET Core `IConfiguration` section (e.g., `appsettings.json`) and **hot-reloads** when the file changes |
+| `ConfigurationReadingExtensions` | The binding logic: turn raw config keys into `RouteConfig`/`ClusterConfig` objects |
+| `ConfigurationSnapshot` | An immutable `IProxyConfig` capturing one read of the file + its change token |
+
+**The change-token mechanism** is worth pausing on because it recurs throughout .NET. A *change token* is a tiny object that lets a consumer register a callback to be invoked once when "the thing changed." The file provider watches the file; on edit it produces a *new* snapshot with a *new* token and signals the old one. The `ProxyConfigManager` (§4) is listening, so it re-reads and rebuilds. This is the plumbing that makes **zero-downtime hot reload** possible — the concept from Foundations Part 3 §4, now you can see exactly which files implement it.
+
+### `RouteValidators/` and `ClusterValidators/` — the guardrails
+
+Before any config becomes live, it is **validated**, because a bad config that goes live breaks real traffic. Validation is broken into many small, single-purpose validators, each implementing `IRouteValidator` or `IClusterValidator`. This is the **strategy pattern applied to validation**: each rule is isolated, independently testable, and the set is extensible.
+
+| Route validators | Checks |
+| --- | --- |
+| `PathValidator` | The path pattern is well-formed |
+| `HostValidator` | Host rules are valid |
+| `MethodsValidator` | HTTP methods are recognized and non-contradictory |
+| `HeadersValidator` / `QueryParametersValidator` | Header/query match rules are coherent |
+| `AuthorizationPolicyValidator` / `CorsPolicyValidator` | Referenced auth/CORS policies actually exist |
+| `RateLimitPolicyValidator` / `OutputCachePolicyValidator` / `TimeoutPolicyValidator` | Referenced policies exist and are valid |
+
+| Cluster validators | Checks |
+| --- | --- |
+| `DestinationValidator` | Destination addresses are valid |
+| `HealthCheckValidator` | Active/passive health settings are sane (intervals, thresholds) |
+| `LoadBalancingValidator` | The named load-balancing policy exists |
+| `SessionAffinityValidator` | Affinity settings are coherent |
+| `ProxyHttpClientValidator` / `ProxyHttpRequestValidator` | HTTP client/request options are valid |
+
+`ConfigValidator.cs` is the coordinator that runs all the registered validators and aggregates their errors. **Why so granular?** Because validation rules are exactly the kind of thing that grows over time and that third parties want to extend. Isolating each rule means adding one without touching the others — the Open/Closed Principle in practice.
+
+> **Common mistake this design prevents:** adopting a route that points at a nonexistent cluster, or a cluster naming a load-balancing policy that isn't registered. Without pre-adoption validation, these would fail *per request* at runtime, intermittently and confusingly. Validating up front converts a runtime mystery into a startup/reload error with a clear message.
+
+---
+
+## 3. `Model/` — The Runtime Model (Layer 3)
+
+### What problem it solves
+
+The declarative `*Config` objects describe *intent*, but they lack the things that change at runtime: which destinations are currently healthy, the live in-flight request counts, the currently-resolved destination set. `Model/` holds the **runtime state** the data plane actually reads on every request — and it is engineered to be read concurrently, lock-free, while being updated. This folder is the **bridge between the two planes** and the literal embodiment of the immutable-snapshot concurrency pattern.
+
+### The structure: identity vs. config vs. dynamic state
+
+Read `Model/README.md` once — it states the discipline explicitly. Every runtime entity is split into three conceptual parts, following a strict rule: **every member must be immutable, OR an `AtomicHolder<T>` wrapping an immutable `T`, OR a thread-safe primitive like `AtomicCounter`.**
+
+For each of the three abstractions you get a trio:
+
+| Abstraction | "Identity / live" object | "Config slice" object | "Dynamic slice" |
+| --- | --- | --- | --- |
+| Route | `RouteState` | `RouteModel` (wraps a `RouteConfig` + compiled transforms) | — |
+| Cluster | `ClusterState` | `ClusterModel` (wraps a `ClusterConfig` + resolved HTTP client) | `ClusterDestinationsState` (the current usable destination set) |
+| Destination | `DestinationState` | `DestinationModel` (wraps a `DestinationConfig`) | `DestinationHealth` / `DestinationHealthState` (live active+passive health) |
+
+The `State` object is the stable handle the data plane holds; inside it, **atomic holders** point at the current config slice and dynamic slice. When config reloads, a new `ClusterModel` is built and the holder is repointed — *atomically*. When new destinations are discovered or health changes, a new `ClusterDestinationsState` / `DestinationHealth` is built and swapped. A request that started a microsecond before the swap keeps using the old slice (consistent snapshot); a request a microsecond after sees the new one. **No locks, no torn reads, no stalls.** This is the single most important engineering idea in the whole project, and `Model/` is where it lives.
+
+```
+   ClusterState  (stable handle the pipeline holds)
+     ├── Model           : AtomicHolder<ClusterModel>          ◀ swapped on config reload
+     ├── DestinationsState: AtomicHolder<ClusterDestinationsState> ◀ swapped on discovery/health change
+     └── (per-destination) DestinationState
+            ├── Model  : AtomicHolder<DestinationModel>        ◀ config reload
+            └── Health : DestinationHealth (active+passive)    ◀ runtime events
+```
+
+### The other Model files (the data-plane handoff)
+
+These wire the runtime model into the actual request pipeline:
+
+| File | Role |
+| --- | --- |
+| `IReverseProxyFeature` / `ReverseProxyFeature` | A per-request "feature" object placed on the HTTP context that carries the chosen route/cluster/destination snapshot for *this* request. This is the consistency anchor — the pipeline reads everything through it. |
+| `HttpContextFeaturesExtensions` | Convenience accessors to get the proxy feature off the request |
+| `ProxyPipelineInitializerMiddleware` | The first proxy middleware: it captures the matched route/cluster into the feature, establishing the snapshot the rest of the pipeline uses |
+| `IReverseProxyApplicationBuilder` / `ReverseProxyApplicationBuilder` | The builder used to assemble the inner proxy middleware pipeline |
+| `IClusterChangeListener` | A hook to be notified when clusters are added/changed/removed at runtime |
+
+**The "feature" concept** is an ASP.NET Core idiom worth learning: the `HttpContext` carries a collection of *features* — typed objects attached to the request that middleware use to share state. YARP uses one to pass "here is the route, cluster, and destination snapshot bound to this request" down the pipeline without globals and without re-reading shared state. It is how the data plane gets its consistent snapshot at request start (Foundations Part 3 §3).
+
+---
+
+## 4. `Management/` — The Orchestrator
+
+### What problem it solves
+
+Something has to *coordinate* the whole control plane: pull from the provider(s), run validation and filters, build the runtime model, diff against the previous model, register routes as ASP.NET Core endpoints, perform the atomic swap, and listen for change tokens to do it all again. That coordinator is `Management/`, and its centerpiece is `ProxyConfigManager` — the most important single class in the project.
+
+### `ProxyConfigManager` — the heart of the control plane
+
+Its own summary comment captures its dual nature: it "provides a method to apply Proxy configuration changes" **and** is an implementation of ASP.NET Core's `EndpointDataSource` "that supports being dynamically updated in a thread-safe manner while avoiding locks on the hot path."
+
+Unpack that:
+
+- **As a config applier:** it holds the array of `IProxyConfigProvider`s, and on startup (and on every change-token signal) it: reads each provider's current `IProxyConfig` → runs `IProxyConfigFilter`s → runs the `IConfigValidator` → builds/updates the `Model/` runtime objects (creating new immutable slices and swapping atomic holders) → notifies `IConfigChangeListener`s and `IClusterChangeListener`s.
+
+- **As an `EndpointDataSource`:** ASP.NET Core's routing system consumes *endpoint data sources*. By being one, `ProxyConfigManager` feeds YARP's routes directly into the platform's matching engine (Part 02, `Routing/`). When config changes, it raises the endpoint-source's change signal so routing rebuilds its match table — again, atomically, no hot-path locks. This is how a config edit instantly changes which routes match, with zero downtime.
+
+The `_syncRoot` lock you'll see exists only to serialize *writers* (config updates happen rarely and one at a time); **readers — the request pipeline — never take it.** That is the precise realization of "lock the cold path, never the hot path."
+
+### The rest of `Management/`
+
+| File | Role |
+| --- | --- |
+| `ReverseProxyServiceCollectionExtensions` | Defines `AddReverseProxy()` — the entry point that registers *every* control-plane and data-plane service in the DI container. This is where all the interface→implementation bindings (the seams) are declared. |
+| `IReverseProxyBuilder` / `ReverseProxyBuilder` | The fluent builder returned by `AddReverseProxy()`, onto which you chain `.LoadFromConfig(...)`, `.AddTransforms(...)`, custom policies, etc. |
+| `IReverseProxyBuilderExtensions` | The chainable methods (`LoadFromConfig`, `LoadFromMemory`, add-policy helpers) that hang off the builder |
+| `IProxyStateLookup` | A read API to query the live model — "give me the cluster with this id," "list all routes." Used by tools, the K8s controller, and tests to introspect current state. |
+
+**Why a builder pattern?** Because configuration of *services* in .NET is fluent and incremental: `AddReverseProxy().LoadFromConfig(...).AddTransforms(...)`. Each call registers more into the DI container. The builder is just a typed handle that makes those additions discoverable and ordered. As an embedded engineer, think of it as a structured init sequence where each method wires one more peripheral.
+
+---
+
+## 5. How the Control Plane Components Interact (control flow)
+
+Putting it together — the life of a configuration change, end to end:
+
+```
+ (1) Source changes (file edited / code calls Update() / K8s pushes)
+        │  change token fires
+        ▼
+ (2) ProxyConfigManager wakes up  [Management/]
+        │  reads current IProxyConfig from each IProxyConfigProvider
+        ▼
+ (3) IProxyConfigFilter(s) transform the declarative config  [Configuration/]
+        ▼
+ (4) IConfigValidator runs all Route/Cluster validators  [Configuration/*Validators/]
+        │  invalid?  → reject, keep old model live, raise error to IConfigChangeListener
+        │  valid?    ↓
+ (5) Build/refresh runtime Model: new immutable slices  [Model/]
+        │  diff vs. previous; reuse unchanged objects
+        ▼
+ (6) Atomically swap AtomicHolders + raise EndpointDataSource change
+        │  in-flight requests keep old snapshot; routing rebuilds match table
+        ▼
+ (7) Notify IClusterChangeListener / IConfigChangeListener
+        ▼
+ (8) New requests now see the new model.  No locks were taken on the request path.
+```
+
+Notice how each numbered step lives in a specific subfolder, and how validation (step 4) is the gate that protects the atomic swap (step 6). This is the control plane's entire job: **turn an untrusted, changing, source-specific description into a validated, immutable, lock-free runtime model — continuously and safely.**
+
+---
+
+## 6. What To Pay Attention To / Production Notes
+
+- **The three layers are not redundant — they have different change rates.** If you only remember one thing: `*Config` = user intent (changes on edit); `*State`/`*Model` = live runtime (changes on health/discovery). The `AtomicHolder` is the hinge between them.
+- **Validation is a security and reliability boundary**, not a formality. In production, a malformed config push that bypassed validation could take down every route at once. The validator/atomic-swap design ensures a bad config is *rejected* and the last-good model stays live.
+- **The `EndpointDataSource` integration** is the clever bit that earns YARP the platform's high-performance route matching for free, while still supporting hot reload. In an interview, "how do you change routing rules at runtime without dropping requests?" is well answered by: immutable snapshot + atomic reference swap + dynamic endpoint data source.
+
+> **Interview relevance.** This document is essentially a worked example of three classic topics on your list: **separation of concerns** (3-layer config), **lock-free concurrency / snapshot consistency** (the `Model/` discipline), and the **control-plane/data-plane split** (a core distributed-systems architecture pattern). Be able to draw the §1 and §5 diagrams from memory.
+
+Next: **Part 02 — The Data Plane**, where we follow a live request through `Routing` → `SessionAffinity` → `LoadBalancing` → `Health` → `ServiceDiscovery` → `Transforms` → `Forwarder`, plus `Limits`, `Delegation`, `WebSocketsTelemetry`, and the `Utilities` that make it all fast.
+# YARP Project Components — Part 02: The Data Plane (the request pipeline)
+
+> The data plane is the half of `Yarp.ReverseProxy` that *executes* the configuration the control plane (Part 01) produced. It runs on **every single request**, must be fast and allocation-light, and only ever **reads** the immutable runtime model. This document follows a live request through the pipeline, component by component, in the order the request actually encounters them, then covers the cross-cutting `Utilities/`.
+>
+> Each component is a folder in `src/ReverseProxy/`. We covered the *concepts* (load-balancing theory, health checking, transforms, etc.) in the Foundations Traffic-Management doc; here we map those concepts onto the **actual components and how they connect**.
+
+---
+
+## 1. The Pipeline, Drawn Once
+
+ASP.NET Core processes requests through an ordered **middleware pipeline** (Foundations Part 1 §7.2). YARP inserts its own inner pipeline. Here is the order a request flows through, with each stage's owning folder:
+
+```
+   Kestrel parses request
+        │
+        ▼
+  ┌──────────────────┐
+  │ Endpoint Routing │  Routing/   ── match request → route → cluster
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────────────────┐
+  │ ProxyPipelineInitializer      │  Model/ (Part 01) ── capture snapshot into the request feature
+  └────────┬─────────────────────┘
+           ▼
+  ┌──────────────────┐
+  │ Session Affinity │  SessionAffinity/  ── re-pin returning clients
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ Load Balancing   │  LoadBalancing/  ── pick ONE destination …
+  └────────┬─────────┘            … from the HEALTH-filtered, DISCOVERY-resolved set
+           │                         (Health/ + ServiceDiscovery/ feed this)
+           ▼
+  ┌──────────────────┐
+  │ Passive Health   │  Health/  ── observe outcome of the forward (wraps the forward)
+  │  + Limits        │  Limits/
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ Forwarder        │  Forwarder/  ── transform request → stream to backend → stream response back
+  │  (+ Transforms)  │  Transforms/
+  └──────────────────┘
+```
+
+The exact ordering is configurable and some stages only appear when their feature is enabled, but this is the canonical flow. Read each section below as "the request is now here."
+
+---
+
+## 2. `Routing/` — Matching the Request to a Route
+
+### What it does and why
+
+The first decision: *which route (and therefore cluster) does this request belong to?* YARP does **not** build its own matching engine — it plugs into ASP.NET Core's high-performance **endpoint routing** (a prefix-tree matcher), and extends it with the dimensions a proxy needs beyond path. This reuse is a deliberate architecture choice: get the platform's battle-tested, fast path matching for free, add only what's missing.
+
+### The components
+
+| File | Role |
+| --- | --- |
+| `ProxyEndpointFactory` | Turns each `RouteConfig` (Part 01) into an ASP.NET Core **endpoint** with the right matchers attached. Called by `ProxyConfigManager` when building/refreshing config. |
+| `HeaderMatcherPolicy` + `HeaderMatcher` + `IHeaderMetadata`/`HeaderMetadata` | A custom **matcher policy** that lets routing accept/reject candidates based on request **headers** (with the match modes from Part 01) |
+| `QueryParameterMatcherPolicy` + `QueryParameterMatcher` + `IQueryParameterMetadata`/`QueryParameterMetadata` | Same idea for **query parameters** |
+| `ReverseProxyIEndpointRouteBuilderExtensions` + `ReverseProxyConventionBuilder` | The `MapReverseProxy()` API and the fluent conventions to customize the proxy pipeline |
+| `DirectForwardingIEndpointRouteBuilderExtensions` | API for "direct forwarding" — mapping a single endpoint straight to the forwarder, bypassing the full route/cluster model (covered in §8) |
+
+**The matcher-policy concept** is the thing to learn here. ASP.NET Core routing matches in two phases: build candidate endpoints by path, then let registered `MatcherPolicy` objects vote candidates in or out using other criteria. By implementing header and query matcher policies, YARP makes those dimensions first-class participants in the *same fast pass* as path matching, rather than a slow post-filter. The `*Metadata` types are how a route declares "I require header X" so the policy knows to evaluate it.
+
+> **Output of this stage:** the request is now bound to a route → cluster. The `ProxyPipelineInitializerMiddleware` (Part 01, `Model/`) captures that into the per-request feature, establishing the consistent snapshot the rest of the pipeline reads.
+
+---
+
+## 3. `SessionAffinity/` — Sticky Sessions
+
+### What it does and why
+
+Some backends hold per-user in-memory state, so a returning client should go back to the *same* destination. Affinity runs *before* load balancing: if the request already carries an affinity marker, affinity pins the destination and load balancing is effectively skipped; if not, the request flows on and, after a destination is chosen, affinity stamps a marker for next time. (Concept: Foundations Traffic-Management §4.)
+
+### The components, grouped by responsibility
+
+| Concern | Files |
+| --- | --- |
+| **Pipeline stage** | `SessionAffinityMiddleware` — checks for an existing affinity, resolves or defers, and orchestrates the policies |
+| **"How do we recognize the client?" (policies)** | `ISessionAffinityPolicy` + `CookieSessionAffinityPolicy`, `HashCookieSessionAffinityPolicy`, `ArrCookieSessionAffinityPolicy`, `CustomHeaderSessionAffinityPolicy` |
+| **"Keep the marker tamper-proof" (base classes)** | `BaseEncryptedSessionAffinityPolicy`, `BaseHashCookieSessionAffinityPolicy` — share the protect/unprotect logic (uses ASP.NET Core **data protection**) |
+| **Stamping the marker on responses** | `AffinitizeTransform` + `AffinitizeTransformProvider` — a transform (see §7) that writes the affinity cookie/header onto the response |
+| **What to do when the pinned destination is gone (failure policies)** | `IAffinityFailurePolicy` + `RedistributeAffinityFailurePolicy` (re-balance to a healthy one) and `Return503ErrorAffinityFailurePolicy` (refuse) |
+| **Result types / helpers** | `AffinityResult`, `AffinityStatus`, `AffinityHelpers`, `SessionAffinityConstants`, `Log` |
+
+The structure literally encodes the three design questions from the concept doc: *recognize* (the policies), *protect* (the base classes), *handle failure* (the failure policies). The different cookie policies exist because real deployments need different cookie semantics — `ArrCookie` mimics the format Azure App Service's ARR affinity uses, for interop; `HashCookie` stores a hash rather than an encrypted blob; the encrypted base protects the binding from inspection/forgery.
+
+---
+
+## 4. `LoadBalancing/` — Choosing One Destination
+
+### What it does and why
+
+Once the cluster and the set of *available* destinations are known, load balancing picks exactly one. (Theory and policy trade-offs: Foundations Traffic-Management §2.) Every policy is an `ILoadBalancingPolicy`; the cluster names which one to use; the middleware applies it.
+
+### The components
+
+| File | Role |
+| --- | --- |
+| `LoadBalancingMiddleware` | The pipeline stage: reads the available destinations from the request feature, asks the configured policy to pick one, writes the choice back to the feature |
+| `ILoadBalancingPolicy` | The seam — implement this for a custom policy |
+| `RoundRobinLoadBalancingPolicy` | Cycles through destinations in order |
+| `RandomLoadBalancingPolicy` | Uniform random pick (stateless) |
+| `LeastRequestsLoadBalancingPolicy` | Picks the fewest in-flight requests (load-aware) |
+| `PowerOfTwoChoicesLoadBalancingPolicy` | Samples two at random, picks the less loaded (the scalable default) |
+| `FirstLoadBalancingPolicy` | Always the first available (active/passive failover) |
+| `LoadBalancingPolicies` | Constants for the built-in policy names |
+| `AppBuilderLoadBalancingExtensions` | Registration helpers |
+
+**How it reads load:** the load-aware policies (`LeastRequests`, `PowerOfTwoChoices`) need each destination's live in-flight count. That counter lives on `DestinationState` as an `AtomicCounter` (`Utilities/`, §10), incremented when a request starts forwarding and decremented when it completes — a lock-free atomic, never a lock. This is the concrete link between the load-balancing theory and the concurrency primitives.
+
+---
+
+## 5. `Health/` — Keeping Destinations Healthy
+
+### What it does and why
+
+Load balancing must only choose among **healthy** destinations. `Health/` continuously assesses each destination via two complementary mechanisms — **active** probing and **passive** observation — and decides the *available* set the load balancer sees. (Theory: Foundations Traffic-Management §3, including the circuit-breaker analogy and "panic mode.")
+
+### The components, grouped
+
+| Group | Files | Role |
+| --- | --- | --- |
+| **Active probing** | `ActiveHealthCheckMonitor` (+`.Log`), `IActiveHealthCheckMonitor`, `ActiveHealthCheckMonitorOptions`, `DefaultProbingRequestFactory` / `IProbingRequestFactory`, `DestinationProbingResult` | A background monitor sends probe requests on a schedule and records the outcomes |
+| **Active policy** | `IActiveHealthCheckPolicy`, `ConsecutiveFailuresHealthPolicy` (+`Options`) | Decide health from probe results (default: N failures in a row → unhealthy) |
+| **Passive observation** | `PassiveHealthCheckMiddleware`, `IPassiveHealthCheckPolicy`, `TransportFailureRateHealthPolicy` (+`Options`) | A middleware wraps the forward, watches real outcomes, trips on failure *rate* in a window |
+| **Applying results** | `DestinationHealthUpdater`, `IDestinationHealthUpdater`, `NewActiveDestinationHealth` | Combine active+passive into each destination's health (writes new immutable `DestinationHealth` and swaps it) |
+| **Scheduling** | `EntityActionScheduler` | A reusable timer that fires per-cluster actions (probes, reactivations) on intervals |
+| **Choosing the usable set** | `IAvailableDestinationsPolicy`, `HealthyAndUnknownDestinationsPolicy`, `HealthyOrPanicDestinationsPolicy`, `ClusterDestinationsUpdater` / `IClusterDestinationsUpdater` | Turn per-destination health into the cluster's *available* destination list the LB reads |
+| **Constants** | `HealthCheckConstants` | Well-known policy names (`ConsecutiveFailures`, `TransportFailureRate`, `HealthyAndUnknown`, `HealthyOrPanic`) |
+
+**The interaction worth tracing:** active and passive are independent inputs. `DestinationHealthUpdater` merges them into a `DestinationHealth` value (which has the three states Healthy/Unhealthy/Unknown). `ClusterDestinationsUpdater` then runs the `IAvailableDestinationsPolicy` to produce the `ClusterDestinationsState` (the dynamic slice from Part 01) that load balancing consumes. The `HealthyOrPanic` policy is the production safety net: if filtering leaves zero destinations, send to all rather than fail everyone. `EntityActionScheduler` is a nice reusable piece — a generic "do this action per entity on a recurring interval" timer, used both for probing and for passively-failed destinations' reactivation timers.
+
+---
+
+## 6. `ServiceDiscovery/` — Resolving Destinations Dynamically
+
+### What it does and why
+
+A `DestinationConfig` may name a *host* rather than fixed addresses, and the real instances behind that host change as the fleet scales. `ServiceDiscovery/` resolves abstract destinations into concrete addresses, refreshing over time. (Concept: Foundations Traffic-Management §5.)
+
+### The components
+
+| File | Role |
+| --- | --- |
+| `IDestinationResolver` | The seam — "given configured destinations, return the resolved concrete set (and a change signal)" |
+| `DnsDestinationResolver` (+ `DnsDestinationResolverOptions`) | Built-in resolver that turns host names into IP addresses via DNS, on an interval |
+| `ResolvedDestinationCollection` | The result type — the resolved addresses plus a change token |
+| `NoOpDestinationResolver` | The default when discovery is off — passes destinations through unchanged |
+
+The resolver feeds the **control plane**: when resolution produces a new set, it triggers a model update so the new destinations flow into health checking and load balancing exactly like statically-listed ones. This is why discovery sits at the boundary — it's a *source of dynamic destinations*, and the Kubernetes controller (Part 04) is a heavyweight, push-based sibling of this same idea.
+
+---
+
+## 7. `Transforms/` — Rewriting Requests and Responses
+
+### What it does and why
+
+The inbound request is rarely a byte-for-byte copy of the outbound one: headers must be added/removed/rewritten, paths and queries adjusted, the original client's identity re-injected via forwarded headers. `Transforms/` is the general request/response rewriting mechanism — a mini-pipeline inside the forward step. (Concept and the forwarded-header trust boundary: Foundations Traffic-Management §6.)
+
+### The structure: factories build, transforms execute
+
+This folder has two layers, and seeing the split makes it readable:
+
+**`Transforms/Builder/`** — the *assembly* layer. It reads declarative/fluent transform config and produces the concrete transform objects for each route, composed into an ordered pipeline. This is where the `ITransformFactory` / `ITransformProvider` seams live and where the per-route transform pipeline is built once at config time (not per request).
+
+**`Transforms/*` (the root)** — the *execution* layer: the concrete transforms, grouped by what they touch.
+
+| Category | Representative files | What they do |
+| --- | --- | --- |
+| **Request headers** | `RequestHeaderTransform`, `RequestHeaderValueTransform`, `RequestHeaderRemoveTransform`, `RequestHeadersAllowedTransform`, `RequestHeaderRouteValueTransform` | Add/set/remove/allow-list request headers |
+| **Forwarded headers** | `RequestHeaderXForwardedForTransform`, `…XForwardedHostTransform`, `…XForwardedProtoTransform`, `…XForwardedPrefixTransform`, `RequestHeaderForwardedTransform`, `ForwardedTransformActions/Extensions/Factory`, `NodeFormat` | Inject `X-Forwarded-*` / `Forwarded` with the correct append/set/off **action** (the trust boundary) |
+| **Original host / client cert** | `RequestHeaderOriginalHostTransform`, `RequestHeaderClientCertTransform` | Preserve original `Host`; forward the client TLS cert to the backend |
+| **Path** | `PathStringTransform`, `PathRouteValuesTransform`, `PathTransformFactory/Extensions` | Prefix removal, pattern rewrites, route-value substitution |
+| **Query** | `QueryParameterFromStaticTransform`, `QueryParameterFromRouteTransform`, `QueryParameterRemoveTransform`, `QueryTransformContext`, `QueryTransformFactory/Extensions` | Add/remove query parameters |
+| **HTTP method** | `HttpMethodChangeTransform`, `HttpMethodTransformFactory/Extensions` | Change the request method |
+| **Response** | `ResponseHeaderValueTransform`, `ResponseHeaderRemoveTransform`, `ResponseCondition`, `ResponseFuncTransform` | Modify response headers, optionally conditionally |
+| **Escape hatches** | `RequestFuncTransform`, `ResponseFuncTransform` | Run *your own* lambda as a transform |
+| **Context + base** | `RequestTransform`, `RequestTransformContext`, `RequestTransformer`, `HttpTransformer` | Base classes and the per-request context the transforms mutate |
+
+**The two-layer (factory/transform) design** matters: parsing config and validating transform syntax happens **once** at config time in the builder; the per-request work is just running the already-built transform objects against the request context. This keeps the hot path cheap — a recurring theme. `HttpTransformer` is the base type the forwarder calls; the default implementation already does correct header copying (respecting hop-by-hop vs end-to-end, Foundations Part 1 §5.2), and your transforms layer on top.
+
+---
+
+## 8. `Forwarder/` — The Hot Core
+
+### What it does and why
+
+This is the component that does the actual proxying: take the (transformed) request, send it to the chosen destination over a pooled HTTP client, and stream the response back — all without buffering bodies in memory. It is the most performance-critical folder in the repository. (Concepts: streaming/backpressure, connection pooling — Foundations Part 3 §1–2.)
+
+### The components, grouped
+
+| Group | Files | Role |
+| --- | --- | --- |
+| **The engine** | `HttpForwarder`, `IHttpForwarder`, `IHttpForwarderExtensions` | The core algorithm: build outbound request, apply transforms, send, copy bodies both ways, classify the result |
+| **Pipeline stage** | `ForwarderMiddleware` | The middleware that invokes the forwarder for routed requests using the cluster's destination/client |
+| **Outbound HTTP client** | `IForwarderHttpClientFactory`, `ForwarderHttpClientFactory`, `ForwarderHttpClientContext`, `CallbackHttpClientFactory`, `DirectForwardingHttpClientProvider` | Create/configure the per-cluster `HttpClient` (`SocketsHttpHandler`) — the connection pool |
+| **Streaming** | `StreamCopier`, `StreamCopyHttpContent`, `StreamCopyResult`, `EmptyHttpContent`, `DelegatingStream` (in Utilities) | Pump bytes in fixed-size pooled buffers with backpressure; full-duplex for upgrades |
+| **Request shaping** | `RequestTransformer`, `HttpTransformer`, `RequestUtilities`, `ProtocolHelper`, `ForwarderRequestConfig` | Translate inbound→outbound request semantics, protocol/version handling |
+| **Error model** | `ForwarderError`, `ForwarderErrorFeature`, `IForwarderErrorFeature` | A precise classification of *what* failed (timeout, connect failure, body copy error, client disconnect, …) |
+| **Telemetry** | `ForwarderTelemetry`, `ForwarderStage` | `EventSource` instrumentation of each forwarding stage (consumed by Part 03) |
+| **Tracing propagation** | `ReverseProxyPropagator` | Carries W3C distributed-trace context across the proxy→backend hop (Foundations Part 3 §5) |
+
+**The two ways to use the forwarder.** YARP supports a full mode (route → cluster → LB → health → forward, everything in this series) and a **direct forwarding** mode where you map a single endpoint straight to `IHttpForwarder.SendAsync(...)` with your own destination and transformer — no clusters, no load balancing. Direct forwarding (exposed via `Routing/DirectForwardingIEndpointRouteBuilderExtensions`) is for when you want YARP's fast, correct HTTP-forwarding engine but your app already decides where to send each request. Knowing both modes exist clarifies why the forwarder is a self-contained, independently-usable engine and not welded to the rest of the pipeline.
+
+**The error feature** is a small but production-critical design: instead of failures collapsing into a generic exception, every failure is tagged with a specific `ForwarderError`, exposed on the request via `IForwarderErrorFeature`. This is what lets logs, traces, and **passive health** (§5) react precisely — e.g., "connection refused" should affect health differently than "client disconnected mid-response."
+
+---
+
+## 9. The Two Specialized Stages: `Limits/` and `Delegation/`
+
+### `Limits/`
+
+| File | Role |
+| --- | --- |
+| `LimitsMiddleware` | Applies request-level limits (e.g., max request body size) for the matched route/cluster before forwarding |
+
+Small but important: it's the per-route enforcement point that protects the proxy and backends from oversized/abusive requests (the resource-exhaustion defense from Foundations Part 3 §6). Rate limiting and timeouts themselves reuse ASP.NET Core's middleware, referenced by the policy-name constants in `Configuration/`; `Limits/` covers what the platform doesn't.
+
+### `Delegation/`
+
+| File | Role |
+| --- | --- |
+| `HttpSysDelegator`, `IHttpSysDelegator`, `HttpSysDelegatorMiddleware` | On Windows with the **HTTP.sys** server, hand a request off to another process **at the kernel level**, so the response bypasses YARP entirely |
+| `DelegationExtensions`, `AppBuilderDelegationExtensions` | Registration/wiring |
+| `DummyHttpSysDelegator` | A no-op used on non-Windows platforms so the rest of the code can depend on the interface unconditionally |
+
+This is a niche, Windows-only, extreme optimization (Foundations Part 3 §8): the fastest forwarding is forwarding you can avoid by delegating the OS connection. The `Dummy` implementation is a nice example of the **null-object pattern** — providing a do-nothing implementation so platform differences don't leak into the rest of the codebase.
+
+---
+
+## 10. `WebSocketsTelemetry/` — Instrumenting Upgraded Connections
+
+### What it does and why
+
+WebSocket (and other upgraded) connections break the request/response model — they're long-lived, bidirectional byte streams (Foundations Part 1 §5.4). Normal request metrics don't describe them, so this folder adds dedicated instrumentation: how long the connection lived, how much data flowed each way, why it closed.
+
+| File | Role |
+| --- | --- |
+| `WebSocketsTelemetryMiddleware` | Wraps upgraded connections to observe them |
+| `WebSocketsTelemetryStream` | A stream wrapper that counts bytes flowing in each direction |
+| `WebSocketsParser`, `WebSocketCloseReason` | Understand WebSocket framing enough to detect close and reason |
+| `HttpUpgradeFeatureWrapper`, `HttpConnectFeatureWrapper` | Intercept the upgrade/CONNECT handshake to insert the instrumentation |
+| `WebSocketsTelemetry`, `WebSocketsTelemetryExtensions` | The `EventSource` + wiring |
+
+The pattern here — **wrapping a stream to measure it without changing behavior** (the decorator pattern) — is worth noting; it's how you add observability to a byte pump without slowing it down or altering semantics.
+
+---
+
+## 11. `Utilities/` — The Cross-Cutting Toolbox
+
+These aren't a pipeline stage; they're the low-level primitives the whole data plane is built from. As an embedded engineer you'll find these familiar in spirit — they're about doing things without allocating and without locking.
+
+| File | What it is / why it matters |
+| --- | --- |
+| `AtomicCounter` | Lock-free integer counter (e.g., per-destination in-flight count for load balancing). The concrete concurrency primitive behind §4. |
+| `ActivityCancellationTokenSource` | A pooled/reusable cancellation source tying request timeouts to .NET `Activity` tracing |
+| `IClock` / `ValueStopwatch` | Abstract time + an allocation-free stopwatch (a `struct`), so timing code is testable and cheap |
+| `IRandomFactory` / `RandomFactory` / `NullRandomFactory` | Abstracted randomness (for Random/P2C load balancing) so it's deterministic in tests |
+| `ValueStringBuilder` | A stack-based, allocation-light string builder for hot-path string assembly |
+| `ParsedMetadataEntry` | Cached parsing of route/cluster metadata so repeated reads don't re-parse |
+| `TlsFrameHelper` | Parses TLS handshake frames (e.g., to read SNI) without a full TLS stack |
+| `*EqualHelper`, `CollectionEqualityHelper`, `ConcurrentDictionaryExtensions` | Efficient equality/diffing used when the control plane compares old vs. new config to reuse unchanged objects |
+| `DelegatingStream` | Base for stream wrappers (used by the forwarder/WebSocket instrumentation) |
+| `Observability`, `EventIds` | Centralized logging/activity ids |
+| `TaskUtilities`, `SkipLocalsInit` | Async helpers; a compiler hint to skip zeroing locals for speed |
+
+**The recurring theme across `Utilities/`:** avoid allocations (lots of `struct`/`Value*` types), avoid locks (atomics), and abstract anything non-deterministic (clock, random) so the hot path is both fast and testable. This folder is where YARP's performance obsession is most visible at the primitive level. The use of `struct` types like `ValueStopwatch` and `ValueStringBuilder` is specifically to keep them on the stack and out of the garbage collector's way — directly relevant to your performance-optimization goals.
+
+---
+
+## 12. How the Data-Plane Components Interact (the full trace)
+
+```
+ Request ─▶ Routing/ matches route+cluster
+          ─▶ ProxyPipelineInitializer captures snapshot into IReverseProxyFeature  [Model/]
+          ─▶ SessionAffinity/ : returning client? pin destination, else continue
+          ─▶ LoadBalancing/ : pick 1 destination from the available set …
+                 ▲ available set produced by Health/ (ClusterDestinationsUpdater)
+                 ▲ destinations resolved by ServiceDiscovery/ (e.g. DNS)
+                 ▲ in-flight counts read via AtomicCounter [Utilities/]
+          ─▶ Limits/ : enforce request limits
+          ─▶ PassiveHealth middleware wraps the forward to observe outcome  [Health/]
+          ─▶ Forwarder/ : Transforms/ rewrite request ▶ StreamCopier pumps body to backend
+                          ▶ backend responds ▶ StreamCopier pumps response back
+                          ▶ Transforms/ rewrite response ▶ SessionAffinity stamps marker
+          ─▶ outcome classified (ForwarderError) → feeds PassiveHealth + telemetry
+ Response ◀ back to client
+```
+
+Every arrow is a real handoff between folders, and every folder reads the same consistent snapshot captured at the top. That is the data plane: **a chain of single-purpose, swappable middleware stages, each reading an immutable snapshot, cooperating to route → select → transform → forward a request as fast as possible.**
+
+> **Interview relevance.** Being able to narrate this trace — naming the stages, why each exists, and where the lock-free reads happen — is a strong answer to "design an API gateway / reverse proxy" and to "how would you structure a high-throughput request pipeline?" The factory-vs-execution split in `Transforms/`, the null-object pattern in `Delegation/`, and the decorator pattern in `WebSocketsTelemetry/` are reusable design-pattern talking points.
+
+Next: **Part 03 — TelemetryConsumption**, the observability project that subscribes to the `EventSource` streams these components emit.
+# YARP Project Components — Part 03: `Yarp.Telemetry.Consumption`
+
+> This is the observability companion project (`src/TelemetryConsumption/`). It is **optional** — YARP proxies fine without it — but it is the canonical example of a pattern every backend engineer must know: **instrument the system with near-zero-cost structured events, and subscribe to them out-of-band to produce metrics and traces.** This document explains the project's purpose, the .NET diagnostics machinery it's built on, and each of its seven area subfolders.
+>
+> Concept background: Foundations Part 3 §5 (the three pillars — logs, metrics, traces — plus `EventSource`/`EventCounter`). Here we map that onto the actual components.
+
+---
+
+## 1. The Problem This Project Solves
+
+A reverse proxy sits on the critical path of every request, so two things are true at once: it is the **best place to observe** system behavior, and its own instrumentation must be **almost free**, or it would slow down the very traffic it measures.
+
+These two requirements are in tension. Verbose logging is informative but expensive (string formatting, I/O) on a hot path. The resolution, baked into .NET, is **`EventSource`**: a mechanism for emitting strongly-typed, structured diagnostic events that cost essentially **nothing when no one is listening**, and only do work when a subscriber attaches. YARP (and the .NET runtime itself — sockets, DNS, TLS, HTTP, Kestrel) emit a rich stream of such events.
+
+`Yarp.Telemetry.Consumption` is the **consumer** side: it subscribes to those event streams and turns them into something you can use — periodic **metrics** and per-event **callbacks** into code you write. It is deliberately a *separate* package from `Yarp.ReverseProxy` because observation is optional and you may not want its overhead or dependencies in every deployment.
+
+```
+   PRODUCERS (emit EventSource events, ~free when unobserved)
+   ┌──────────────────────────────────────────────────────────┐
+   │ .NET runtime: Sockets · DNS · TLS · HTTP                  │
+   │ ASP.NET Core: Kestrel                                     │
+   │ YARP: Forwarder stages · WebSockets                       │
+   └───────────────────────────────┬──────────────────────────┘
+                                   │  (event stream)
+                                   ▼
+   CONSUMER  =  Yarp.Telemetry.Consumption
+   ┌──────────────────────────────────────────────────────────┐
+   │ EventListenerService(s) subscribe & decode the events     │
+   │   → produce METRICS (periodic aggregates)                 │
+   │   → invoke your IXxxTelemetryConsumer callbacks per event │
+   └──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. The Core .NET Concepts (so the folder makes sense)
+
+Three platform ideas underpin everything in this project. Learn them once; you'll meet them across all of .NET observability.
+
+**`EventSource`.** A class that *produces* structured events. Each event has a name and typed payload. Crucially, emitting is gated on whether any listener has enabled that source at a given level, so an unobserved event is a cheap branch, not a formatting + write. This is why YARP can instrument every forwarding stage without measurable overhead in production where no consumer is attached.
+
+**`EventListener`.** A class that *consumes* events. You override callbacks to be told when an event source is created (so you can choose to enable it) and when an event is written (so you can read its payload). `Yarp.Telemetry.Consumption`'s `EventListenerService` types are `EventListener`s wrapped as hosted background services.
+
+**`EventCounter` / counters.** A sub-mechanism for *metrics* specifically: sources periodically publish aggregate numbers (counts, rates, means, percentiles) over a polling interval. The consumer subscribes with a desired interval and receives the rolled-up values. This is how the `*Metrics` types in each subfolder get populated.
+
+**Two output modes.** For each area, the project offers both:
+
+| Output mode | Type shape | Use it for |
+| --- | --- | --- |
+| **Metrics** | `XxxMetrics` snapshot + `IMetricsConsumer<XxxMetrics>` | Dashboards, alerting, trends (periodic aggregates) |
+| **Per-event callbacks** | `IXxxTelemetryConsumer` interface you implement | Detailed per-request tracing, custom correlation |
+
+You implement whichever consumer interface you care about, register it in DI, and the matching `EventListenerService` pushes data to it. This is the same **interface-seam** pattern as the rest of YARP: the project doesn't decide what you do with telemetry, it just delivers it to your implementation.
+
+---
+
+## 3. The Top-Level Components
+
+| File (`TelemetryConsumption/*.cs`) | Role |
+| --- | --- |
+| `EventListenerService` | The shared base: a hosted `EventListener` that knows how to attach to a named event source, decode events, and dispatch to consumers. Every area's listener derives from this. |
+| `IMetricsConsumer<TMetrics>` | The generic seam for receiving periodic metric snapshots of type `TMetrics` |
+| `MetricsOptions` | Configuration for metrics collection (e.g., the polling interval) |
+| `TelemetryConsumptionExtensions` | The registration API — `AddTelemetryConsumer(...)` / `AddTelemetryListeners(...)` that wire your consumer implementations and start the listener services |
+
+The design is uniform: a generic base (`EventListenerService`), a generic metrics seam (`IMetricsConsumer<T>`), and then **one subfolder per telemetry *area*** that specializes both. Once you understand one subfolder, you understand all seven — they differ only in *which* event source they listen to and *what* their payload/metrics contain.
+
+---
+
+## 4. The Seven Area Subfolders
+
+Each subfolder corresponds to one **producer** of events. Together they give end-to-end visibility across the entire network stack a proxied request touches — from the raw socket up to YARP's own forwarding logic. This breadth is the point: when a request is slow, you can localize *which layer* the time went to.
+
+### A request's journey, mapped to the telemetry areas
+
+```
+ client
+   │  TCP connect ............... Sockets/      (connections, bytes)
+   │  TLS handshake ............. NetSecurity/  (handshake count/duration)
+   │  (server side) accepted by . Kestrel/      (inbound connection/request metrics)
+   ▼
+ YARP forwards:
+   │  DNS resolve backend ....... NameResolution/ (lookups, duration, failures)
+   │  outbound HTTP ............. Http/         (outbound request metrics, HttpClient)
+   │  forwarding stages ......... Forwarder/    (per-stage timings, proxy-specific)
+   │  if upgraded ............... WebSockets/   (duration, bytes each way, close reason)
+   ▼
+ backend
+```
+
+### The subfolders in detail
+
+| Subfolder | Listens to | What it tells you | Key files |
+| --- | --- | --- | --- |
+| **`Sockets/`** | .NET Sockets `EventSource` | Connections established, bytes sent/received at the TCP layer — the rawest I/O view | `SocketsEventListenerService`, `SocketsMetrics`, `ISocketsTelemetryConsumer` |
+| **`NameResolution/`** | .NET DNS `EventSource` | DNS lookups: how many, how long, failures. Catches "discovery/DNS is slow" problems | `NameResolutionEventListenerService`, `NameResolutionMetrics`, `INameResolutionTelemetryConsumer` |
+| **`NetSecurity/`** | .NET TLS `EventSource` | TLS handshakes: count, duration, protocol/cipher. Catches "handshake storms" and TLS perf issues | `NetSecurityEventListenerService`, `NetSecurityMetrics`, `INetSecurityTelemetryConsumer` |
+| **`Http/`** | .NET `HttpClient`/`SocketsHttpHandler` `EventSource` | Outbound HTTP requests YARP makes to backends: timings, request/response start, connection pool behavior | `HttpEventListenerService`, `HttpMetrics`, `IHttpTelemetryConsumer` |
+| **`Kestrel/`** | ASP.NET Core Kestrel `EventSource` | Inbound side: connections and requests *arriving* at the proxy | `KestrelEventListenerService`, `KestrelMetrics`, `IKestrelTelemetryConsumer` |
+| **`Forwarder/`** | YARP's own `ForwarderTelemetry` `EventSource` | Proxy-specific: time spent in each **forwarding stage** (Part 02 §8), proxied request counts, error categories. The most YARP-specific area | `ForwarderEventListenerService`, `ForwarderMetrics`, `ForwarderStage`, `IForwarderTelemetryConsumer` |
+| **`WebSockets/`** | YARP's WebSocket telemetry (Part 02 §10) | Upgraded-connection lifetime, bytes each direction, close reason | `WebSocketsEventListenerService`, `WebSocketCloseReason`, `IWebSocketsTelemetryConsumer` |
+
+**Why split by area rather than one giant consumer?** Two reasons. First, **producers are independent** — each event source is owned by a different layer (OS sockets vs. DNS vs. YARP's forwarder), so subscribing is naturally per-source. Second, **you rarely want all of it** — a team debugging TLS perf enables `NetSecurity/` only, paying zero cost for the rest. The per-area split lets you opt in granularly.
+
+### The `ForwarderStage` concept (the most useful one)
+
+`Forwarder/ForwarderStage` enumerates the *phases* of a single forward — e.g., sending request headers, sending request body, receiving response headers, receiving response body, response upgrade. Because the forwarder fires an event at each stage boundary, a consumer can compute "how long did we spend waiting on the backend's first byte vs. streaming the body?" This is what turns a vague "the request was slow" into "the backend took 190 ms to start responding." It's the proxy-aware equivalent of a distributed trace's spans, and it's why the `Forwarder/` area is the one you'll reach for most when diagnosing latency.
+
+---
+
+## 5. How It Connects to the Rest of YARP
+
+The relationship is intentionally **one-directional and loose**: `Yarp.ReverseProxy` (and the runtime) *emit* events; `Yarp.Telemetry.Consumption` *listens*. The core library has no dependency on the consumption library — it would emit the same events whether or not anyone listens. This is good architecture: the observed system doesn't know or care about the observer, so observability can be added, removed, or replaced without touching the proxy.
+
+```
+   Yarp.ReverseProxy ──emits EventSource events──▶  (nothing, if no listener)
+                                                │
+                          (optional) ───────────┘
+                                ▼
+   Yarp.Telemetry.Consumption listens ──▶ your IMetricsConsumer / IXxxTelemetryConsumer
+                                                ▼
+                          your exporter (OpenTelemetry, Prometheus, logs, …)
+```
+
+The `samples/ReverseProxy.Metrics.Sample` and `samples/Prometheus/` projects (Part 05) show this end-to-end: implement a consumer, forward the data to Prometheus, scrape it into Grafana. **OpenTelemetry** is the modern, vendor-neutral standard you'd typically bridge to here.
+
+---
+
+## 6. What To Pay Attention To / Production Notes
+
+- **"Free when unobserved" is the whole trick.** The reason YARP can afford to instrument every socket, handshake, and forwarding stage is that `EventSource` events are gated on subscription. Internalize this — it's the standard answer to "how do you add deep observability without hurting performance?"
+- **Metrics vs. events is a real trade-off.** Metrics are cheap, aggregate, and great for dashboards/alerts but lose per-request detail. Per-event consumers give full fidelity (per-request tracing) but cost more and can flood you with data. Production systems use metrics for *everything always-on* and per-event tracing *sampled* or *on-demand*.
+- **Layered visibility localizes faults.** The seven areas exist so you can answer "which layer is slow?" — socket, DNS, TLS, inbound (Kestrel), outbound (Http), proxy logic (Forwarder), or WebSocket. Drawing the §4 journey diagram is a great way to reason about observability coverage in *any* system.
+
+> **Interview relevance.** This project is a compact, real-world illustration of: the **three pillars of observability**, the **low-overhead-instrumentation** pattern (`EventSource`), the **producer/consumer decoupling** of observed system vs. collector, and **metrics-vs-tracing trade-offs**. These are directly on your learning list (Observability) and come up constantly in system-design discussions. Connect it to distributed tracing: the `Forwarder/` stages are the proxy's contribution to an end-to-end trace, and `ReverseProxyPropagator` (Part 02 §8) is what keeps that trace connected across the backend hop.
+
+Next: **Part 04 — Kubernetes.Controller**, the most intricate companion project, and a self-contained tour of the controller/reconciler pattern that powers Kubernetes itself.
+# YARP Project Components — Part 04: `Yarp.Kubernetes.Controller`
+
+> This is the most intricate companion project, and the one whose subfolders (Caching, Certificates, Client, Protocol, Queues, Rate, …) looked mysterious. They stop being mysterious the moment you realize they are **the standard anatomy of a Kubernetes controller** — the same pattern Kubernetes itself is built from. This document teaches that pattern first, then walks every subfolder as a part of it.
+>
+> This is a self-contained distributed-systems case study and is squarely on your learning list (Kubernetes, service discovery, controllers, event-driven coordination). Concept background: Foundations Part 3 §7 (the reconcile loop, informers, work queues, declarative state).
+
+---
+
+## 1. What This Project Is and Why It Exists
+
+In Kubernetes, you don't run servers by hand — you *declare desired state* (objects like `Ingress`, `Service`, `Endpoints`) and the cluster makes reality match. An **`Ingress`** object says, in effect, "expose this HTTP routing to the outside world." But an Ingress is just data; something must *read* those objects and *configure an actual proxy* to implement the routing. That something is an **ingress controller**.
+
+`Yarp.Kubernetes.Controller` is an ingress controller backed by YARP. Its entire job:
+
+> **Continuously watch the Kubernetes API, translate the cluster's `Ingress`/`Service`/`Endpoints` state into YARP routes/clusters/destinations, and push that config into a running YARP proxy — keeping them in sync forever as the cluster changes.**
+
+It is, in YARP's terms, a **dynamic configuration source** (Part 01) — a heavyweight, push-based sibling of the DNS service discovery in Part 02. Everything it produces ultimately flows into `Yarp.ReverseProxy`'s control plane via an `IProxyConfigProvider`.
+
+---
+
+## 2. The Controller Pattern (learn this once, it's everywhere)
+
+Every serious Kubernetes controller — including this one — is built from the same handful of moving parts. Internalize this diagram and the subfolders become self-explanatory.
+
+```
+        Kubernetes API server  (source of truth for desired state)
+                │   ▲
+   watch stream │   │ status updates
+                ▼   │
+   ┌─────────────────────────────────────────────────────────────┐
+   │  INFORMER  (Client/)                                         │
+   │   • LIST all objects once, then WATCH for changes            │
+   │   • reconnect/resync on disconnect (resourceVersion)         │
+   └───────────────┬─────────────────────────────────────────────┘
+                   │ add/update/delete events
+                   ▼
+   ┌───────────────────────────┐      ┌──────────────────────────┐
+   │  CACHE  (Caching/)        │◀────▶│  WORK QUEUE (Queues/+Rate/)│
+   │  local mirror of objects  │      │  rate-limited, deduplicated│
+   └───────────────────────────┘      └─────────────┬─────────────┘
+                                                    │ dequeue
+                                                    ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │  RECONCILER  (Services/)                                     │
+   │   • read current cache state                                 │
+   │   • CONVERT (Converters/) Ingress→YARP config                │
+   │   • push to proxy (ConfigProvider/ + Protocol/)              │
+   └─────────────────────────────────────────────────────────────┘
+```
+
+Three principles make this robust, and they're worth stating because they're the "why" behind the whole design:
+
+1. **Level-triggered, not edge-triggered.** The reconciler acts on the *current total state* in the cache, not on the individual event that woke it. So a missed, duplicated, or out-of-order event cannot corrupt it — the next reconcile reads the full truth and converges. This is the single most important reliability property of controllers.
+
+2. **Desired vs. observed, converging continuously.** The loop never assumes "done." It repeatedly drives observed state (what the proxy is configured with) toward desired state (what Kubernetes declares). Drift (a pod dies, a spec changes) is automatically corrected on the next pass.
+
+3. **Decoupled via cache + queue.** The fast event stream (informer) is decoupled from the potentially-slow reconcile (which talks to the proxy) by a cache (so reconcile reads a consistent local snapshot) and a queue (so bursts are absorbed, deduplicated, and rate-limited). This is a classic **producer/consumer with backpressure** — directly relevant to your event-driven-systems and message-queue goals.
+
+Now every subfolder is just "which part of this picture am I?"
+
+---
+
+## 3. The Subfolders, Mapped to the Pattern
+
+| Subfolder | Role in the pattern | One-line purpose |
+| --- | --- | --- |
+| `Client/` | **Informer + API client** | Watch Kubernetes resources; maintain the watch connection |
+| `Caching/` | **Cache** | Local in-memory mirror of the watched objects |
+| `Queues/` | **Work queue** | Buffer + deduplicate items needing reconciliation |
+| `Rate/` | **Rate limiter** | Token-bucket limiter that paces the queue |
+| `Services/` | **Reconciler + controller loop** | Dequeue, reconcile, drive convergence |
+| `Converters/` | **Translation** | Turn Ingress/Service/Endpoints into YARP config |
+| `ConfigProvider/` | **Output seam** | Hand generated config to YARP's control plane |
+| `Protocol/` | **Distribution** | Push config from controller to (possibly many) proxy instances |
+| `Certificates/` | **TLS support** | Manage certs for the controller's own dispatch endpoint |
+| `Hosting/` | **Lifecycle** | Run informers/controller as background services |
+| `Management/` | **Composition root** | DI registration + wiring of everything above |
+| `Protocol`/`Properties`/`NamespacedName.cs`/`YarpOptions.cs` | misc/support | Shared types, options, assembly metadata |
+
+The rest of this document takes them in roughly data-flow order.
+
+---
+
+## 4. `Client/` — The Informer (the watch machinery)
+
+### What problem it solves
+
+You cannot poll the Kubernetes API ("list all ingresses") every second — it would hammer the API server and be slow. The **informer** pattern solves this: do one initial **LIST** to get everything, then open a long-lived **WATCH** stream that pushes only *changes*. The informer keeps a local cache current and notifies subscribers of add/update/delete events. This is the foundational efficiency trick of the entire Kubernetes ecosystem.
+
+### The components
+
+| File | Role |
+| --- | --- |
+| `ResourceInformer<TResource, TListResource>` | The generic informer base: LISTs, then WATCHes, tracks `resourceVersion` to resume after disconnects, reconnects on failure, and dispatches change events. Its own doc-comment describes exactly this. Runs as a background service. |
+| `IResourceInformer<T>` / `IResourceInformerRegistration` | The seam to subscribe to a resource's change events and manage the subscription lifetime |
+| `V1IngressResourceInformer`, `V1ServiceResourceInformer`, `V1EndpointsResourceInformer`, `V1IngressClassResourceInformer`, `V1SecretResourceInformer` | Concrete informers, one per Kubernetes resource type the controller cares about |
+| `ResourceSelector<T>` | Narrows *which* objects to watch (e.g., by namespace/label) |
+| `GroupApiVersionKind` | Identifies a Kubernetes resource type (its API group/version/kind) |
+| `KubernetesClientOptions` | Configuration for the API client |
+| `IIngressResourceStatusUpdater` / `V1IngressResourceStatusUpdater` | Writes **status back** to the Ingress object (e.g., "this ingress is being served by load balancer X") — controllers report status, closing the loop |
+
+**Why five separate informers?** Because computing routing requires correlating five resource types: an `Ingress` references `Service`s, a `Service`'s actual pod addresses live in `Endpoints`, `IngressClass` decides whether *this* controller should handle a given ingress, and `Secret`s hold TLS certs. The controller must watch all five and react when *any* of them changes. The `resourceVersion` tracking you'll see in `ResourceInformer` is how Kubernetes watches resume exactly where they left off after a dropped connection — a small but critical correctness detail for not missing or replaying changes.
+
+---
+
+## 5. `Caching/` — The Local Mirror
+
+### What problem it solves
+
+The reconciler needs to read a **consistent, fast, local** view of all relevant objects without calling the API server. The cache is that view, kept current by the informers' change events.
+
+### The components
+
+| File | Role |
+| --- | --- |
+| `ICache` / `IngressCache` | The cache abstraction and its implementation: stores the current ingresses, services, endpoints, etc., and answers "what does the world look like right now?" |
+| `NamespaceCache` | Per-namespace partition of the cache (Kubernetes objects live in namespaces) |
+| `IngressData`, `ServiceData`, `Endpoints`, `IngressClassData` | The cached representations of each resource type |
+
+The cache is also where **filtering logic** lives — e.g., "does this ingress's `IngressClass` mean we should handle it?" Only relevant objects are retained. When a reconcile runs, it reads from here, not from Kubernetes — that's what makes reconciles fast and gives them a stable snapshot to work from (echoes of the immutable-snapshot idea from the core library, applied to cluster state).
+
+---
+
+## 6. `Queues/` and `Rate/` — Backpressure and Pacing
+
+### What problem they solve
+
+Changes can arrive in bursts (a deployment rolls 50 pods at once). You don't want 50 reconciles; you want **one** reconcile against the final state, and you don't want to overwhelm the API server or the proxy. The work queue **deduplicates** and the rate limiter **paces**.
+
+### `Queues/`
+
+| File | Role |
+| --- | --- |
+| `IWorkQueue<T>` / `WorkQueue<T>` | A queue that **collapses duplicates** (adding the same item twice while it's pending is a no-op) and supports delayed re-queue (for retries with backoff) |
+| `ProcessingRateLimitedQueue<T>` | A `WorkQueue` wrapped with a rate limiter so items are dequeued no faster than allowed |
+
+**The deduplication property is the key insight.** Because the loop is level-triggered (§2), processing "ingress changed" once after a burst is just as correct as processing it 50 times — and far cheaper. The queue exploits this: many change events collapse to a single pending work item. The controller even uses a single shared "ingress changed" queue item (you can see `_ingressChangeQueueItem` in `IngressController`) — any change just ensures that one item is queued, and one reconcile recomputes everything.
+
+### `Rate/`
+
+| File | Role |
+| --- | --- |
+| `Limiter` | A **token-bucket** rate limiter (Foundations Traffic-Management §7): tokens refill at a steady rate; each action spends one; empty bucket means wait |
+| `Limit` | The rate/burst configuration |
+| `Reservation` | A "reservation" of a future token — lets a caller ask "when may I proceed?" and wait that long |
+
+This is a from-scratch token-bucket implementation (mirroring the one in Go's Kubernetes client libraries). Studying it is a genuinely good exercise: it's the same algorithm used for API rate limiting everywhere, implemented compactly. It paces both the watch-reconnect attempts (so a flapping connection doesn't hammer the API server) and the reconcile rate.
+
+---
+
+## 7. `Services/` — The Reconciler (the heart)
+
+### What problem it solves
+
+This is where the loop actually lives: pull work items, read the cache, compute the desired YARP config, and apply it. Its doc-comments lay out the architecture explicitly — the controller "receives notifications from informers," saves data "in an `ICache`," queues resources "which need to be reconciled," and a "background task dequeues items and passes them to an `IReconciler`."
+
+### The components
+
+| File | Role |
+| --- | --- |
+| `IngressController` | The **controller loop**, a background service. Wires informers → cache → queue, and runs the dequeue loop. Holds registrations to all five informers. |
+| `IReconciler` / `Reconciler` | The **reconcile step**: read the cache, convert to YARP config (via `Converters/`), and push it out (via `IUpdateConfig`). Also updates Ingress status. |
+| `QueueItem` / `ReconcileData` | The unit of work and the data gathered for one reconcile pass |
+
+**Trace the loop:** an informer fires "ingress changed" → `IngressController` enqueues the shared change item (deduped) → the rate limiter releases it → `IngressController` dequeues and calls `Reconciler.ProcessAsync` → the reconciler reads the whole cache, builds the complete YARP config, and calls `IUpdateConfig` to publish it → it writes status back to the Ingress objects. The loop is *whole-world recompute*, which is exactly the level-triggered robustness from §2. Notice the dependencies in `Reconciler`'s constructor: `ICache` (read state), `IUpdateConfig` (publish), `IIngressResourceStatusUpdater` (report status) — the three responsibilities of any reconcile.
+
+---
+
+## 8. `Converters/` — Ingress → YARP Translation
+
+### What problem it solves
+
+Kubernetes `Ingress` objects describe routing in *Kubernetes' vocabulary* (rules, paths, backend service references, TLS secrets). YARP needs it in *its* vocabulary (`RouteConfig`/`ClusterConfig`/`DestinationConfig`). `Converters/` is the translation layer — the semantic bridge between the two systems.
+
+### The components
+
+| File | Role |
+| --- | --- |
+| `YarpParser` | The core translator: walks Ingress rules + the correlated Service/Endpoints data and emits YARP routes and clusters |
+| `YarpIngressContext` / `YarpIngressOptions` | The working context + the per-ingress options (often from annotations) that tune the translation |
+| `YarpConfigContext` | Accumulates the YARP config being built across all ingresses |
+| `ClusterTransfer` | Helper for assembling cluster/destination data during conversion |
+
+This is where Kubernetes-specific knowledge concentrates: how an `Ingress` path maps to a YARP route match, how a `Service` + its `Endpoints` become a cluster with destinations (the actual pod IPs come from `Endpoints`, not the `Service`), and how Ingress **annotations** (the standard Kubernetes extension mechanism — arbitrary key/value metadata on objects) select YARP features like load-balancing policy or health checks. If you want to understand "how does a YAML Ingress become a live route," this folder is the answer.
+
+---
+
+## 9. `ConfigProvider/` and `Protocol/` — Getting Config to the Proxy
+
+There are two deployment shapes for an ingress controller, and these two folders support them. This is a subtle but important distinction.
+
+### `ConfigProvider/` — the in-process seam
+
+| File | Role |
+| --- | --- |
+| `IUpdateConfig` | The seam the reconciler calls to publish new config |
+| `KubernetesConfigProvider` | An `IProxyConfigProvider` (Part 01!) that hands the generated config to a YARP proxy **running in the same process** |
+
+When controller and proxy run together, `KubernetesConfigProvider` simply *is* a YARP config source — the reconciler updates it, and YARP's `ProxyConfigManager` picks up the change through the exact same `IProxyConfigProvider` mechanism as a JSON file would. **This is the punchline of the whole project:** a wildly dynamic source (Kubernetes) plugs into the identical seam as a static file. Everything you learned about validation and atomic hot-swap in Part 01 applies unchanged.
+
+### `Protocol/` — the distributed (out-of-process) shape
+
+| File | Role |
+| --- | --- |
+| `Dispatcher` / `IDispatcher` / `IDispatchTarget` | Holds the set of currently-connected proxy instances and **broadcasts** new config to all of them |
+| `DispatchController` | An HTTP/endpoint that proxy instances connect to in order to receive config |
+| `Receiver` / `ReceiverOptions` | The **proxy-side** client: connects to the controller and receives config updates |
+| `DispatchConfigProvider` / `MessageConfigProviderExtensions` | On the proxy side, expose received messages as an `IProxyConfigProvider` |
+| `Message` / `DispatchActionResult` | The wire format and result types for config messages |
+
+This supports the **separated** topology: **one** controller computing config, and **many** stateless proxy pods receiving it over a connection. The `Dispatcher` keeps a list of connected targets (note in its code the `ImmutableList<IDispatchTarget>` swapped under a lock — the same immutable-snapshot discipline) and pushes the latest config to each; a newly-connected proxy immediately gets the current config. This is a small **pub/sub / fan-out** system — directly on your distributed-systems learning list. The separation matters operationally: you can scale proxies horizontally without each one independently hammering the Kubernetes API; only the single controller watches the cluster.
+
+```
+   SEPARATED TOPOLOGY
+                    ┌──────────────┐  config broadcast   ┌─────────┐
+   K8s API ──watch──│  Controller  │────────────────────▶│ Proxy 1 │
+                    │ (Dispatcher) │────────┐            └─────────┘
+                    └──────────────┘        │             ┌─────────┐
+                                            └────────────▶│ Proxy 2 │ … N
+                                                          └─────────┘
+```
+
+---
+
+## 10. `Certificates/` and `Hosting/` — Support Infrastructure
+
+### `Certificates/`
+
+| File | Role |
+| --- | --- |
+| `ICertificateHelper` / `CertificateHelper` | Load/parse certificates (e.g., from Kubernetes `Secret`s) |
+| `IServerCertificateSelector` / `ServerCertificateSelector` | Choose the right server certificate per incoming TLS connection (SNI-based selection) for the controller's own dispatch endpoint |
+
+The controller's dispatch endpoint (§9) is itself an HTTPS server that proxies connect to, so it needs TLS. The certificate selector picks the correct cert based on the requested hostname — the same SNI mechanism real multi-tenant servers use.
+
+### `Hosting/`
+
+| File | Role |
+| --- | --- |
+| `BackgroundHostedService` | A base class for long-running background services with clean start/stop and lifetime handling. The informers and the controller loop all derive from it. |
+| `HostedServiceAdapter` / `ServiceCollectionHostedServiceAdapterExtensions` | Glue to register the same object as both a typed service *and* a hosted background service in DI |
+
+**The hosted-service concept** is the .NET way to run continuous background work inside an app: implement the hosted-service contract and the host starts/stops you with the application. Informers (long-lived watches) and the controller loop (long-lived dequeue) are exactly this. As an embedded engineer, think of these as the app's "tasks" or "threads of execution" that the runtime supervises — `BackgroundHostedService` is the shared scaffolding so each one gets correct startup ordering, cancellation, and shutdown.
+
+---
+
+## 11. `Management/`, options, and shared types
+
+| File | Role |
+| --- | --- |
+| `Management/KubernetesCoreExtensions`, `KubernetesReverseProxyServiceCollectionExtensions`, `KubernetesReverseProxyWebHostBuilderExtensions` | The **composition root**: the `AddKubernetes...()` registration methods that wire informers, cache, queue, reconciler, converters, dispatcher, and the config provider into the DI container and the host. This is the "main wiring" that assembles the whole pattern. |
+| `YarpOptions` | Top-level controller configuration (namespace scoping, the controller's class name, server cert settings, etc.) |
+| `NamespacedName` | The Kubernetes identity of an object: namespace + name. A tiny but pervasive value type. |
+| `Properties/` | Assembly metadata |
+
+`Management/` is where you'd start reading if you wanted to see how the pieces are bolted together, because DI registration is effectively an index of every component and its chosen implementation.
+
+---
+
+## 12. End-to-End: a pod scales up
+
+To cement it, trace a real event — Kubernetes adds a pod to a service the controller exposes:
+
+```
+ 1. Kubernetes updates the Service's Endpoints (new pod IP added)
+ 2. V1EndpointsResourceInformer's WATCH stream pushes the change   [Client/]
+ 3. IngressCache updates its mirror of that Endpoints object       [Caching/]
+ 4. The change enqueues the shared "ingress changed" item (deduped) [Queues/]
+ 5. Rate/ releases it when a token is available                     [Rate/]
+ 6. IngressController dequeues → Reconciler.ProcessAsync            [Services/]
+ 7. Reconciler reads the whole cache, YarpParser rebuilds full config [Converters/]
+ 8. Reconciler calls IUpdateConfig                                  [ConfigProvider/]
+ 9a. In-process: KubernetesConfigProvider fires its change token →
+     YARP's ProxyConfigManager validates + atomically swaps the model  [→ Part 01]
+ 9b. Separated: Dispatcher broadcasts the config to all proxies     [Protocol/]
+10. New pod IP is now a healthy destination; load balancing includes it [→ Part 02]
+11. Reconciler writes status back to the Ingress object            [Client/]
+```
+
+Notice how it ends by flowing into the core library you already understand. **The Kubernetes controller is "just another config source"** — the most dynamic one, but it reuses the identical control-plane → data-plane machinery from Parts 01–02.
+
+---
+
+## 13. What To Pay Attention To / Production & Interview Notes
+
+- **Level-triggered reconciliation is the headline lesson.** "Recompute the whole desired state from cache, idempotently, on any change" is *the* controller pattern, and it's why controllers are so robust to dropped/duplicate events. Be able to explain why this is safer than reacting to individual deltas.
+- **The cache+queue+ratelimiter trio is a reusable producer/consumer-with-backpressure design** you'll see far beyond Kubernetes. The dedup-on-enqueue + token-bucket-pacing combination is worth being able to reproduce.
+- **Informers (LIST then WATCH with resourceVersion resume)** are the efficiency backbone of Kubernetes. Knowing how they avoid polling and how they recover from disconnects is common interview territory for infra roles.
+- **In-process vs. separated (Dispatcher) topology** is a real architectural decision: co-located simplicity vs. horizontally-scalable, centrally-watched proxies. The `Protocol/` fan-out is a compact pub/sub example.
+- **It all funnels into `IProxyConfigProvider`** — the same seam as a file. This is excellent evidence for "good abstractions let a static config file and a live Kubernetes cluster be interchangeable inputs."
+
+> This project alone touches: Kubernetes, informers/controllers, service discovery, event-driven coordination, work queues, rate limiting, pub/sub fan-out, background services, and TLS/SNI — a large slice of your distributed-systems and cloud-infrastructure goals, in one readable codebase.
+
+Next: **Part 05 — Application & Supporting Infrastructure**, covering the `Yarp.Application` host, `Common`, and the samples/tests/build machinery that surround the product.
+# YARP Project Components — Part 05: `Yarp.Application` & Supporting Infrastructure
+
+> The first four parts covered the *runtime components* — the proxy library, its telemetry consumer, and the Kubernetes controller. This final part covers everything else in the repository: the **ready-to-run application** (`Yarp.Application`), the small shared `Common` project, and the surrounding cast that makes this a real, maintainable enterprise codebase — `samples/`, `test/`, `testassets/`, and the `eng/` + build/CI machinery. None of this is "the product," but a senior engineer reads all of it to understand how a project is *built, tested, demonstrated, and shipped*.
+>
+> This maps directly to several of your learning goals: CI/CD, testing strategy, and "reading large enterprise repositories."
+
+---
+
+## 1. `Yarp.Application` — "YARP With Batteries Included"
+
+### What it is and why it exists
+
+`Yarp.ReverseProxy` is a *library* — you must write a host app to use it. But many users just want a **runnable proxy**: point it at a config file and go, without writing C#. `Yarp.Application` is that turnkey host. It's a complete ASP.NET Core application that wires up the proxy library with config binding and a few common extra features, and it's the artifact packaged into the official **container image** so people can run YARP as a standalone container.
+
+Think of the relationship like this:
+
+```
+   Yarp.ReverseProxy   =  the engine (a library you embed)
+   Yarp.Application    =  the car built around the engine (a runnable program)
+```
+
+### How it's organized
+
+The project is small and reads top-down from `Program.cs`. As you saw, `Program.cs` parses an optional config-file argument, sets up the `WebApplication` builder, registers features, and runs. The two subfolders specialize behavior:
+
+**`Configuration/`** — binding a config file into strongly-typed options.
+
+| File | Role |
+| --- | --- |
+| `YarpAppConfig` / `YarpAppConfigBinder` | The top-level app config model and the logic to bind a JSON file into it |
+| `StaticFilesOptions` | Settings for serving static files (so the proxy can also serve a local site) |
+| `NavigationFallbackOptions` | Settings for SPA-style fallback routing (serve `index.html` for unmatched client routes) |
+| `TelemetryOptions` | Toggle/observability settings |
+| `TestConfiguration` | Helper config used in tests |
+
+**`Features/`** — each "feature" is a self-contained bundle of registration + middleware wiring that the app can switch on. This is a nice **modular composition** pattern: the app is assembled from optional features.
+
+| File | Role |
+| --- | --- |
+| `ReverseProxyFeature` | Wires the core proxy (calls `AddReverseProxy()`/`MapReverseProxy()` and loads config) |
+| `StaticFilesFeature` | Serves static files from a folder |
+| `NavigationFallbackFeature` | Implements SPA fallback |
+| `LoggingFeature` | Configures logging |
+
+The lesson here for you: a production "host" app is mostly **composition** — choosing which features to register and in what order — on top of a reusable library. The library does the hard work; the application decides the policy. `Extensions.cs` ties the feature registrations together.
+
+> **Note on a naming collision to avoid confusion:** there is a `ReverseProxyFeature` in `Yarp.Application/Features/` (an app-assembly feature) *and* a `ReverseProxyFeature` in `Yarp.ReverseProxy/Model/` (the per-request HTTP context feature from Part 01). Same words, completely different concepts — one is "an app capability to enable," the other is "per-request state on the HttpContext." Context tells them apart.
+
+---
+
+## 2. `src/Common` — Shared Build Glue
+
+| File | Role |
+| --- | --- |
+| `Package.targets` | MSBuild targets shared across projects for NuGet packaging |
+
+This is deliberately tiny. It's not runtime code — it's **build configuration** factored out so multiple projects share consistent packaging behavior. Its existence is a small example of the DRY principle applied to build scripts. Don't over-think it; it's plumbing.
+
+---
+
+## 3. `samples/` — Documentation by Example
+
+### Why samples are their own first-class thing
+
+For a toolkit whose entire value proposition is *customizability*, runnable examples are essential documentation. Each sample is a minimal app demonstrating **one feature in isolation**, so you can read it in five minutes and copy the pattern. When you start working in YARP, the relevant sample is often the fastest way to learn an API. Here is the catalogue and what each teaches:
+
+| Sample | Demonstrates | Maps to (this series) |
+| --- | --- | --- |
+| `BasicYarpSample` | The absolute minimum proxy | Parts 01–02 |
+| `ReverseProxy.Config.Sample` | Loading routes/clusters from a JSON file | Part 01 (`ConfigProvider/`) |
+| `ReverseProxy.Code.Sample` | Configuring the proxy entirely in code | Part 01 (`InMemoryConfigProvider`) |
+| `ReverseProxy.ConfigFilter.Sample` | Programmatically transforming config as it loads | Part 01 (`IProxyConfigFilter`) |
+| `ReverseProxy.Transforms.Sample` | Custom request/response transforms | Part 02 (`Transforms/`) |
+| `ReverseProxy.Auth.Sample` | Authentication/authorization on routes | Part 02 (§7 cross-cutting) |
+| `ReverseProxy.Direct.Sample` | Direct forwarding (no cluster/LB) via `IHttpForwarder` | Part 02 (§8) |
+| `ReverseProxy.HttpSysDelegation.Sample` | Windows HTTP.sys kernel request delegation | Part 02 (`Delegation/`) |
+| `ReverseProxy.LetsEncrypt.Sample` | Automatic TLS certificates via Let's Encrypt | Security (Foundations Part 3 §6) |
+| `ReverseProxy.Metrics.Sample` | Consuming telemetry | Part 03 |
+| `Prometheus/` (`HttpLoadApp`, `Metrics-Prometheus.Sample`) | Exporting metrics to Prometheus + a load generator | Part 03 |
+| `KubernetesIngress.Sample/` (`Ingress`, `Monitor`, `Combined`, `backend`) | Running the controller as an ingress controller, in both combined and separated topologies | Part 04 |
+| `SampleServer`, `StaticSite` | Simple backends/static content to proxy *to* | supporting |
+
+Notice the `KubernetesIngress.Sample` has `Combined` vs. `Ingress`+`Monitor` variants — that's the **in-process vs. separated topology** distinction from Part 04 §9 made tangible. Reading those two samples side by side is the clearest way to internalize that architectural choice.
+
+---
+
+## 4. `test/` — The Testing Strategy
+
+### Why this matters to you specifically
+
+You listed "reading large codebases" and want senior-level intuition. One marker of a mature project is a **layered test strategy**, and YARP's is textbook. Understanding the layers teaches you how serious systems are verified.
+
+| Project | Test type | What it does |
+| --- | --- | --- |
+| `ReverseProxy.Tests` | **Unit tests** | Test individual components in isolation (a single load-balancing policy, one validator, the stream copier) with mocks for dependencies. Fast, focused, run constantly. |
+| `ReverseProxy.FunctionalTests` | **Functional / integration tests** | Spin up a *real* proxy and *real* backend servers in-process and send actual HTTP requests through the whole pipeline. Verify end-to-end behavior, not just units. Slower, higher-confidence. |
+| `Kubernetes.Tests` | Controller tests | Verify the reconcile loop, converters, informers against simulated Kubernetes state |
+| `Application.Tests` | Host tests | Verify the `Yarp.Application` host wiring |
+| `Tests.Common` | Shared test helpers | Utilities reused across the test projects |
+| `TestCertificates` | Test TLS certs | Fixed certificates so TLS paths can be tested deterministically |
+
+### The unit-vs-functional distinction (a core engineering concept)
+
+This is worth dwelling on because it's a frequent interview topic and a real skill:
+
+- **Unit tests** isolate one piece. They're fast and pinpoint *which* component broke, but they can't catch integration bugs (two correct units that don't work together). They lean on the **interface seams** YARP exposes everywhere — you swap a real dependency for a fake/mock to test a component alone. The `IClock` / `IRandomFactory` abstractions in `Utilities/` (Part 02 §11) exist *partly* so tests can inject deterministic time and randomness.
+- **Functional tests** exercise the real assembled system. They catch integration bugs and give confidence the whole pipeline works, but when one fails it's harder to localize, and they're slower. This is why `testassets/` exists (next section): functional tests need real servers to proxy to and real clients to drive traffic.
+
+The general principle — the **test pyramid** — is many fast unit tests at the base, fewer integration tests above, fewer still end-to-end tests at the top. YARP follows it.
+
+---
+
+## 5. `testassets/` — The Supporting Cast for Tests
+
+Functional tests can't proxy to nothing — they need real endpoints. `testassets/` holds small helper programs used *by* the tests (not shipped to users).
+
+| Project | Role |
+| --- | --- |
+| `TestServer` | A configurable backend HTTP server the proxy forwards to during tests |
+| `TestClient` | A client that drives requests through the proxy |
+| `ReverseProxy.Config` / `ReverseProxy.Code` / `ReverseProxy.Direct` | Pre-built proxy host variants (config-driven, code-driven, direct-forwarding) used as the system-under-test in functional/benchmark runs |
+| `BenchmarkApp` | A **performance benchmark** harness — measures throughput/latency of the proxy under load |
+
+`BenchmarkApp` deserves a callout given your performance-optimization goals: YARP treats performance as a *tested, regression-guarded property*, not an afterthought. Benchmarks let maintainers catch "this change made forwarding 5% slower" before it ships. The separation of `testassets/` (helpers) from `test/` (the actual tests) is a clean convention — test code and the infrastructure test code depends on are kept distinct.
+
+---
+
+## 6. `eng/`, Build Scripts, and CI/CD
+
+### What this is
+
+The repository root is full of files that have nothing to do with proxying and everything to do with **how the software is built, versioned, signed, and released**. For a learner this is often the most opaque part of a big repo, so here's the map. You don't need mastery — you need to recognize what each thing is so it stops being noise.
+
+| Area | Files/folders | Purpose |
+| --- | --- | --- |
+| **Bootstrap scripts** | `build.sh/.cmd`, `restore.sh/.cmd`, `test.sh/.cmd`, `pack.sh/.cmd`, `activate.sh/.ps1` | Download a pinned .NET SDK locally and build/restore/test/package without needing a system-wide install. The README's setup steps. |
+| **Build engineering (`eng/`)** | `Versions.props`, `Version.Details.xml`, `Signing.props`, `Publishing.props`, `Build.props` | Centralized version numbers, dependency versions, code-signing and publishing config |
+| **Arcade (`eng/common/`)** | many `.sh/.ps1/.proj` scripts | The **.NET Arcade SDK** — Microsoft's shared build toolchain used across all .NET repos. This is boilerplate you'll see in *every* dotnet org repository; it standardizes builds. You will essentially never edit it. |
+| **MSBuild config** | `Directory.Build.props/.targets`, `TFMs.props`, `global.json`, `NuGet.config` | Project-wide build settings, target frameworks, SDK pinning, package feeds |
+| **CI pipelines** | `azure-pipelines.yml`, `azure-pipelines-pr.yml`, `azure-pipelines-nonprod.yml`, `dotnet-yarp-release.yml`, `.github/` | **CI/CD**: what runs automatically on every pull request (build + test) and on release (build, sign, publish NuGet packages + container image) |
+| **Project metadata** | `LICENSE.txt`, `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `THIRD-PARTY-NOTICES.TXT` | Legal, security-reporting, and contribution governance |
+
+### The CI/CD concept (on your learning list)
+
+**Continuous Integration (CI)**: every time someone proposes a change (a pull request), an automated pipeline checks out the code, builds it, and runs the tests — *before* a human merges it. This catches breakage early and keeps the main branch always-buildable. The `azure-pipelines-pr.yml` is the PR gate.
+
+**Continuous Delivery/Deployment (CD)**: when changes are merged/released, another pipeline builds the *official* artifacts (signed NuGet packages, the container image), and publishes them. `dotnet-yarp-release.yml` and `azure-pipelines.yml` handle this.
+
+The key idea: **the build and release process is itself code** (declarative YAML), versioned alongside the source, reproducible, and automated — no one builds releases by hand on their laptop. The pinned-SDK bootstrap scripts exist precisely so *every* build (your laptop, a teammate's, the CI server) uses the *exact same* compiler and dependencies — reproducibility. As an embedded engineer who's dealt with toolchain drift, you'll appreciate why pinning the SDK to `.dotnet/` in-repo matters.
+
+---
+
+## 7. `docs/` — Design Rationale and Operations
+
+| Folder | Contents |
+| --- | --- |
+| `docs/designs/` | Design discussions: `config.md`, `yarp-tunneling.md` (the tunnel feature from Foundations Part 3 §8), `route-extensibility.md` |
+| `docs/operations/` | Maintainer runbooks: branching, releasing, backporting, dependency flow |
+| `docs/roadmap.md`, `DailyBuilds.md` | Support policy and how to get bleeding-edge builds |
+
+These are gold for a learner: design docs explain the *why* behind features in the maintainers' own words. `docs/designs/yarp-tunneling.md` in particular is a complete, readable distributed-systems design narrative (firewall traversal via outbound WebSocket + HTTP/2 multiplexing) worth studying as an example of how senior engineers document a design before building it.
+
+---
+
+## 8. Putting the Whole Repository Together
+
+Here is the entire repo as one picture, tying all five parts of this series together:
+
+```
+   ┌───────────────────────── PRODUCT (src/) ─────────────────────────┐
+   │                                                                  │
+   │   Yarp.ReverseProxy  ── control plane (Part 01) + data plane (02)│
+   │        ▲          ▲          ▲                                   │
+   │        │ observes │ feeds    │ hosted by                         │
+   │   Telemetry.   Kubernetes.  Yarp.Application (Part 05 §1)        │
+   │   Consumption  Controller                                        │
+   │   (Part 03)    (Part 04)                                         │
+   └──────────────────────────────────────────────────────────────────┘
+        proven by ▼            shown by ▼            shipped by ▼
+     test/ + testassets/      samples/          eng/ + pipelines + docs/
+       (Part 05 §4–5)        (Part 05 §3)        (Part 05 §6–7)
+```
+
+The four source projects are the product; the testing, samples, build, and docs are the **engineering discipline** that turns code into a trustworthy, releasable, learnable open-source project. A senior engineer values both halves — and being able to navigate the second half confidently is exactly the "comfort in very large enterprise repositories" your persona is working toward.
+
+---
+
+## 9. What To Pay Attention To / Takeaways
+
+- **Library vs. application separation** (`ReverseProxy` vs. `Application`) is a reusable design instinct: keep the reusable engine free of host/policy decisions; put composition in a thin app on top.
+- **The test pyramid** (unit in `ReverseProxy.Tests`, functional in `ReverseProxy.FunctionalTests`, benchmarks in `testassets/BenchmarkApp`) is how mature systems balance speed and confidence. The interface seams that make YARP customizable are the *same* seams that make it testable — a deep, recurring connection.
+- **Build/release-as-code** (Arcade, pinned SDK, Azure Pipelines) is the CI/CD discipline on your learning list, seen in a real project. Recognize the parts; you'll meet Arcade in every dotnet repo.
+- **Samples are executable documentation.** When you start contributing, find the sample nearest your task first.
+
+> **Interview relevance.** "How do you test a system like this?" (test pyramid, mocking via interfaces, functional tests with real backends), "How does your CI/CD work?" (PR gates, reproducible pinned builds, automated signed releases), and "How do you structure a reusable library vs. an app?" are all directly answerable from this part.
+
+---
+
+## 10. Series Wrap-Up
+
+You now have a complete component map of the YARP repository:
+
+| Part | Covers | The big idea |
+| --- | --- | --- |
+| **00** | Architecture overview | 4 projects; control plane vs. data plane |
+| **01** | `Configuration`, `Model`, `Management` | 3-layer config; immutable snapshots; the orchestrator |
+| **02** | The request pipeline | A chain of swappable middleware reading a consistent snapshot |
+| **03** | `Telemetry.Consumption` | Free-when-unobserved events; producer/consumer decoupling |
+| **04** | `Kubernetes.Controller` | The reconcile loop; informers; cache+queue+ratelimiter; "just another config source" |
+| **05** | `Application` + infra | Library vs. app; the test pyramid; build/release-as-code |
+
+When you open the source, anchor on three recurring shapes and you'll rarely be lost: a type is almost always either an **immutable snapshot** (`*Config`/`*State`/`*Model`), a **pluggable interface seam** (`I*Provider`/`I*Policy`/`I*Factory`), or a **middleware/pipeline stage** (`*Middleware`). Point at any folder, name its plane and its job, and trace how a request or a config change flows through it — that is the senior-engineer fluency you set out to build.
